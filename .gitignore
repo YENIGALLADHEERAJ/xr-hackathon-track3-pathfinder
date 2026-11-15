@@ -1,0 +1,15 @@
+# build outputs
+src/pathfinder
+src/pathfinder.exe
+*.obj
+*.o
+build/
+
+# python
+__pycache__/
+*.pyc
+
+# local data and run outputs (datasets are fetched with tools/fetch_euroc.py)
+euroc_data/
+runs/
+*.zip

@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build (g++, warnings on)
+        run: g++ -O2 -std=c++17 -Wall -Wextra -o src/pathfinder src/main.cpp
+      - name: Contract tests (C++ and Python)
+        run: |
+          python tools/test_contract.py --cpp
+          python tools/test_contract.py
+      - name: C++ / Python parity on simulated degraded runs
+        run: |
+          pip install numpy
+          python tools/simulate.py /tmp/sim_mav --profile mav --seed 11 --failure cut
+          python tools/simulate.py /tmp/sim_hh --profile handheld --seed 12 --failure nan --duration 60
+          python tools/parity.py /tmp/sim_mav /tmp/sim_hh
+      - name: Budgets (peak RSS, runtime) on Linux
+        run: |
+          src/pathfinder /tmp/sim_mav -o /tmp/est.txt --metadata /tmp/meta.json
+          cat /tmp/meta.json
+          python - <<'EOF'
+          import json
+          m = json.load(open("/tmp/meta.json"))
+          assert m["peak_rss_MB"] <= 8.0, m["peak_rss_MB"]
+          assert m["runtime_ms_per_imu_second"] <= 20.0, m["runtime_ms_per_imu_second"]
+          print("budgets OK: %.2f MB, %.3f ms per IMU-second" % (m["peak_rss_MB"], m["runtime_ms_per_imu_second"]))
+          EOF
+      - name: Docker image builds and runs
+        run: |
+          docker build -t pathfinder .
+          docker run --rm -v /tmp/sim_mav:/data pathfinder /data -o /data/est_docker.txt
+          python - <<'EOF'
+          # container glibc may differ from the runner's in the last ulp of exp/sin:
+          # require identical rows and timestamps, numbers within 1e-4
+          a = [l.split() for l in open("/tmp/est.txt") if not l.startswith("#")]
+          b = [l.split() for l in open("/tmp/sim_mav/est_docker.txt") if not l.startswith("#")]
+          assert len(a) == len(b), (len(a), len(b))
+          assert all(x[0] == y[0] for x, y in zip(a, b)), "timestamps differ"
+          d = max(abs(float(u) - float(v)) for x, y in zip(a, b) for u, v in zip(x[1:], y[1:]))
+          assert d < 1e-4, d
+          print("docker output matches (%d rows, max diff %.1e)" % (len(a), d))
+          EOF
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build (MSVC)
+        shell: cmd
+        run: src\build.bat
+      - name: Contract tests
+        run: |
+          python tools/test_contract.py --cpp
+          python tools/test_contract.py
