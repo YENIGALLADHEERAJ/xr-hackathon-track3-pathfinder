@@ -1,20 +1,24 @@
-# Demo video script (max 3 minutes)
+# Demo video script (2–3 minutes, strict maximum 3)
 
-Record the terminal full-screen at a large font. Have `euroc_data/runs`, `euroc_data/holdout`
-and a built `src/pathfinder` ready (see README, "Results on real EuRoC data").
+Record the terminal full-screen with a large font. Beforehand, prepare an officially degraded run:
+
+```bash
+python tools/make_official_runs.py euroc/V1_02_medium runs_official --script degrade_imu.py --modes euroc
+```
+
+Then run each command once so the first take has no cold-cache delay.
 
 | Time | Show | Say |
 |---|---|---|
-| 0:00 | Title slide | "Track 3, Path Finder: reconstruct a 6-DoF path from a degrading IMU, then dead-reckon 5 seconds after it fails." |
-| 0:15 | Slide: the problem | "Double-integrating a noisy IMU explodes. On our real-flight test runs, plain integration is hundreds of metres off." |
-| 0:35 | Terminal: `head -3` of a degraded `imu0/data.csv`, then `grep -c nan` | "This is the input: real EuRoC IMU with 10x noise, bias drift, spikes, dropped frames, a 2-second blackout and NaN rows at the end." |
-| 0:55 | Terminal: `src/pathfinder <holdout run> -o est.txt --metadata meta.json` | "One command. The C++ build streams the file and writes one pose per row. 4 MB of RAM, under half a millisecond per second of data." |
-| 1:15 | `head -3 est.txt`, `cat meta.json` | "TUM format, exact nanosecond timestamps. The metadata reports runtime, peak memory and dropout handling." |
-| 1:30 | Slide: architecture | "A robust streaming filter, then an offline two-pass smoother. The forward pass writes records to a temp file, and two more passes read it forwards and backwards. Zero phase, still constant memory." |
-| 2:00 | Terminal: `python tools/eval_runs.py euroc_data/holdout --pure` | "Scored on a flight that was never used for tuning. Stand-still baseline 1.82 m, ours 1.65 m: 9% better on every run. Raw integration: hundreds of metres." |
-| 2:25 | Slide: held-out error chart | "Honest limit: with an IMU alone, position stays metre-level. The gains come from never diverging, attitude at the gyro's own limit, and handling failures cleanly." |
-| 2:45 | Terminal: `python tools/test_contract.py --cpp` then `python tools/parity.py ...` | "14 contract tests, and C++ matches the Python reference byte for byte." |
+| 0:00 | Title slide | "Track 3, Path Finder: reconstruct a 6-DoF path from a degrading IMU, and dead-reckon through the 5 seconds after it fails." |
+| 0:15 | Slide: the problem | "Double-integrating a noisy IMU explodes: on our test flights, plain integration is hundreds of metres off." |
+| 0:30 | Terminal: `head -3` and `tail -2` of the degraded `imu0/data.csv` | "This is a real EuRoC flight degraded with the organizers' script: noise and bias ramping up, spikes, stuck and dropped samples, and all-zero rows once the IMU dies." |
+| 0:50 | Terminal: `python src/main.py <run> -o est.txt --metadata meta.json` | "One standalone Python script, standard library only. It detects the column order and units itself, and writes exactly one pose per input row." |
+| 1:10 | `wc -l` of input and output, `tail -2 est.txt`, `input_format` and runtime in `meta.json` | "Same number of rows in and out. The blind window is dead-reckoned in place, nothing appended. About 2 MB of heap and 2.5 ms per second of data, against 8 MB and 20 ms." |
+| 1:35 | Slide: architecture | "A robust streaming filter with rotor-drag velocity aiding, then an offline two-pass smoother: forward and backward passes through a temp file, zero phase, constant memory." |
+| 2:00 | Terminal: `python tools/eval_runs.py <runs> --pure` | "Scored like evo with SE(3) alignment, on a flight never used for tuning. A trajectory that never moves scores 1.82 m; ours is 1.47 m, 19% better. Raw integration is hundreds of metres off." |
+| 2:25 | Slide: held-out error chart | "Honest limit: from an IMU alone, position stays metre-level. The gains come from drag-based velocity, smoothing, attitude at the gyro's own limit, and robust handling of failures." |
+| 2:45 | Terminal: `python tools/test_contract.py` | "24 contract tests: row count, input formats, failure rows, dropouts." |
 | 2:55 | Thank-you slide | "Code, Docker and CI are in the repo. Thanks." |
 
-Tips: run each command once beforehand so the first take has no build or cache delay, and keep
-the terminal font at 18pt or larger so the numbers are legible in the recording.
+Keep the terminal font at 18pt or larger so the numbers are legible in the recording.
