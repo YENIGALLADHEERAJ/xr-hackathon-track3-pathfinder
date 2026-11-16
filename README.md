@@ -43,8 +43,8 @@ Then zip the bundle as `team_name.zip`, using your registered `CollegeName_TeamN
 | Dropouts are missing rows | Timestamp gaps are bridged by dead reckoning; every remaining row gets its pose |
 | Estimate from the IMU file only | No other input is read |
 | Offline; future samples may be used | Two-pass zero-phase smoother (see `src/README.md`) |
-| ≤ 8 MB peak RAM, **measured at heap level** | **2.0 MB** heap peak (tracemalloc), constant in sequence length |
-| ≤ 20 ms compute per 1 s of IMU, one thread | **2.4 ms** per IMU-second, single thread |
+| ≤ 8 MB peak RAM, **measured at heap level** | **1.6–1.9 MB** heap peak (tracemalloc), constant in sequence length |
+| ≤ 20 ms compute per 1 s of IMU, one thread | **2.4–3.3 ms** per IMU-second, single thread (the upper figure includes the rest-window pre-pass) |
 | SE(3)-aligned ATE and RPE (evo) | Output frame: z-up, gravity aligned, starting at the origin |
 
 ### Input formats handled
@@ -66,29 +66,42 @@ The script's other degradations are handled by the front-end:
 
 ## Results with the official degradation script
 
-Real EuRoC flights were degraded with the organizers' `degrade_imu.py` using `tools/make_official_runs.py`. Each flight gets 13 runs:
+Four real sequences covering both datasets the jury uses: two Vicon-room flights, a Machine Hall flight in a much larger space, and a handheld TUM-VI recording with a different IMU. Each was degraded with the organizers' `degrade_imu.py` using `tools/make_official_runs.py`, giving 13 runs per sequence:
 - **Severity:** `--max-level` 1.0 and 0.6, `--gamma` 1.7 and 1.0, plus one run with an extra 2 s dropout.
 - **Input modes:**
   - `euroc`: the intended degradation, in slide-15 column order.
   - `accelfirst`: left in the script's own column order.
   - `direct`: the script applied straight to EuRoC files, so the gyro gets accelerometer-level noise and spikes.
 
-Ground truth is the EuRoC state estimate on every IMU stamp. Parameters were selected on **V1_01** only; **V1_02 is held out** (a faster flight, mean 0.91 m/s).
+| Sequence | Platform | Speed | Stand-still spread | Role |
+|---|---|---|---|---|
+| EuRoC V1_01_easy | multirotor, Vicon room | 0.41 m/s | 1.86 m | parameter selection |
+| EuRoC V1_02_medium | multirotor, Vicon room | 0.91 m/s | 1.82 m | held out for parameter fitting |
+| EuRoC MH_04_difficult | multirotor, large hall | 0.97 m/s | 6.94 m | exposed the bias bug (see below) |
+| TUM-VI room1 | **handheld**, different IMU | 1.07 m/s | 1.01 m | exposed the drag-gating bug (see below) |
 
-| Flight | Mode | Stand-still ATE | **Path Finder ATE** | Checkpoint err | Blind 5 s drift | Dropout-window err | Rotation RPE |
+| Sequence | Mode | Stand-still ATE | **Path Finder ATE** | Checkpoint err | Blind 5 s drift | Dropout-window err | Rotation RPE |
 |---|---|---|---|---|---|---|---|
-| **V1_02 (held out)** | euroc | 1.816 | **1.473 (−18.9%)** | 1.148 | 0.575 | 1.588 | 0.75 °/s |
-| | accelfirst | 1.816 | **1.458 (−19.7%)** | 1.155 | 0.602 | 1.322 | 0.69 °/s |
-| | direct | 1.816 | **1.440 (−20.7%)** | 1.128 | 0.614 | 1.277 | 0.69 °/s |
-| V1_01 (selection) | euroc | 1.857 | **1.522 (−18.0%)** | 1.406 | 0.308 | 1.248 | 0.64 °/s |
-| | accelfirst | 1.857 | **1.519 (−18.2%)** | 1.405 | 0.310 | 1.313 | 0.63 °/s |
-| | direct | 1.857 | **1.463 (−21.2%)** | 1.397 | 0.458 | 1.717 | 2.12 °/s |
+| V1_01 | euroc | 1.857 | **1.522 (−18.0%)** | 1.406 | 0.296 | 1.248 | 0.64 °/s |
+| | accelfirst | 1.857 | **1.519 (−18.2%)** | 1.405 | 0.297 | 1.313 | 0.63 °/s |
+| | direct | 1.857 | **1.463 (−21.2%)** | 1.397 | 0.330 | 1.717 | 2.12 °/s |
+| V1_02 | euroc | 1.816 | **1.473 (−18.9%)** | 1.148 | 0.680 | 1.588 | 0.75 °/s |
+| | accelfirst | 1.816 | **1.458 (−19.7%)** | 1.155 | 0.692 | 1.322 | 0.69 °/s |
+| | direct | 1.816 | **1.440 (−20.7%)** | 1.128 | 0.702 | 1.277 | 0.69 °/s |
+| MH_04 | euroc | 6.942 | **5.609 (−19.2%)** | 4.981 | 0.427 | 6.752 | 0.23 °/s |
+| | accelfirst | 6.942 | **5.572 (−19.7%)** | 4.894 | 0.422 | 6.540 | 0.23 °/s |
+| | direct | 6.942 | **5.641 (−18.7%)** | 4.922 | 0.774 | 6.401 | 1.45 °/s |
+| TUM-VI room1 | euroc | 1.013 | **0.836 (−17.5%)** | 0.763 | 0.832 | 0.771 | 1.78 °/s |
+| | accelfirst | 1.013 | **0.831 (−18.0%)** | 0.760 | 0.841 | 0.781 | 1.78 °/s |
+| | direct | 1.013 | **0.835 (−17.6%)** | 0.770 | 0.860 | 0.800 | 1.84 °/s |
 
-Values are means over the runs in each group, in metres except rotation. ATE is the RMSE after SE(3) alignment, the same as `evo_ape -a`. The stand-still baseline is a trajectory that never moves: the honest bar for IMU-only estimation, since raw double integration of the same data is hundreds of metres off.
+Values are means over the runs in each group, in metres except rotation. **Every group beats the stand-still baseline by 17.5–21.2%.** ATE is the RMSE after SE(3) alignment, the same as `evo_ape -a`. The stand-still baseline is a trajectory that never moves, the honest bar for IMU-only estimation; raw double integration of the same data is 132–1,511 m off. Ground truth is the EuRoC state estimate or the TUM-VI motion capture on every IMU stamp, excluding stamps inside mocap dropouts (TUM-VI has gaps of up to 1 s).
+
+**What was fitted where.** The smoother, shrinkage and drag parameters were selected on V1_01 alone and confirmed on V1_02. MH_04 and TUM-VI were brought in as unseen data. They exposed the two bugs described below, whose fixes are general detectors with physically motivated thresholds, not fitted parameters. The one parameter chosen across all four sequences is the blind-segment velocity decay (0.25 s). So MH_04 and TUM-VI are no longer pure holdouts, and the next validation step would be another unseen sequence (for example MH_05 or TUM-VI room2).
 
 ### How it got there
 
-| Step | V1_02 held-out ATE vs stand-still |
+| Step | V1_02 ATE vs stand-still |
 |---|---|
 | First version, tuned on synthetic data | −1.5% |
 | + gyro bias calibrated only at rest, robust start-up | −1.5% (rotation 2.6 → 0.46 °/s) |
@@ -96,16 +109,24 @@ Values are means over the runs in each group, in metres except rotation. ATE is 
 | + offline two-pass zero-phase smoother | −9.1% |
 | + **official package**: format detection, no appended rows, retuned on `degrade_imu.py` data | **−18.9%** |
 
-All numbers in the table are on the same held-out flight. The first four rows were measured with my own degradation model, the last with the organizers'.
+The first four rows were measured with my own degradation model, the last with the organizers'.
+
+| Fix from the new sequences | Before | After |
+|---|---|---|
+| Drag gated on rotor vibration (TUM-VI, handheld) | **+74.5%** (worse than stand-still) | **−17.5%** |
+| Gyro bias from a detected rest window anywhere in the file (MH_04) | −12.0%, rotation 4.59 °/s | **−19.2%**, rotation **0.23 °/s** |
 
 Key findings along the way:
-1. **Rotor vibration corrupted the gyro bias.** It made slow flight look stationary, and in-flight bias updates soaked up real rotation. The bias is now calibrated once, at rest. That gives 0.46 °/s on clean V1_01, the same as an oracle that knows the true bias.
+1. **Rotor vibration corrupted the gyro bias.** It made slow flight look stationary, and in-flight bias updates soaked up real rotation. The bias is calibrated only at rest, giving 0.46 °/s on clean V1_01, the same as an oracle that knows the true bias.
 2. **One spike in the first second could disable calibration** for the whole flight. Start-up now uses median-based outlier rejection.
-3. **Rotor-drag velocity aiding.** On a multirotor, sideways specific force is rotor drag, which is proportional to body velocity: a drift-free velocity signal from the IMU alone. A multirotor detector gates it. With the final fusion settings, turning drag off makes the V1_01 objective 21% worse. Its gain (−2.45 s) was fitted once on V1_01 ground truth. A larger gain looked better on V1_01 but worse on held-out V1_02, so it was rejected as overfitting.
-4. **Offline zero-phase smoothing.** Forward and backward leaky integrations are averaged, streamed through a temp file so memory stays O(1). The post-failure tail keeps the forward dead reckoning, since there's nothing after it to smooth with.
-5. **The official degradation favours trusting the IMU more.** That means no output shrinkage and faster velocity fusion than my own degradation model suggested.
+3. **Not every recording starts at rest.** MH_04 starts moving, so its 0.078 rad/s gyro bias was never calibrated. Since the task is offline, a pre-pass now finds the quietest 1 s window anywhere in the recording. It accepts the window as rest only if:
+   - the gyro is white noise around its mean (the means of four sub-windows agree within 3× the noise expectation), and
+   - the gravity direction is steady (under 0.25°).
 
-Where V1_01 and V1_02 disagreed (the blind-segment velocity decay: the slow flight prefers 0.25 s, the fast one 1 s), I took the middle of the region where both are within 0.4% (0.5 s), rather than the holdout's optimum.
+   It recovers the true bias on every EuRoC run, to about 0.002 rad/s, even under `direct`-mode gyro noise. It correctly finds no rest window in any of the 14 TUM-VI runs: a hand-held device is never still, and TUM-VI's bias is already compensated.
+4. **Rotor-drag velocity aiding.** On a multirotor, sideways specific force is rotor drag, which is proportional to body velocity: a drift-free velocity signal from the IMU alone. It's worth 21% of the objective on V1_01. On the handheld TUM-VI the original detector (specific-force direction spread) was fooled: a phone carried roughly level also keeps its specific force near vertical. Drag is now also gated on **rotor vibration** (sample-to-sample accelerometer energy): at least 1.4 m/s² for multirotors in flight, under 0.4 for handheld even at maximum official degradation. The gain (−2.45 s) was fitted on V1_01 ground truth. A larger gain looked better on V1_01 but worse on V1_02, so it was rejected.
+5. **Offline zero-phase smoothing.** Forward and backward leaky integrations are averaged, streamed through a temp file so memory stays O(1). The post-failure tail keeps the forward dead reckoning, since there's nothing after it to smooth with.
+6. **The official degradation favours trusting the IMU more:** no output shrinkage, and faster velocity fusion than my own degradation model suggested.
 
 ## Verification
 
@@ -115,7 +136,7 @@ Contract tests cover: one pose per row, no appended poses, all-zero and NaN blin
 python tools/test_contract.py
 ```
 
-Official-degradation evaluation. EuRoC CSVs are fetched by `tools/fetch_euroc.py` (about 4 MB for V1_01). `degrade_imu.py` is the organizers' script from the Track 3 student package.
+Official-degradation evaluation. EuRoC CSVs are fetched by `tools/fetch_euroc.py` (about 4 MB for V1_01; a nested sequence such as V1_02 or MH_04 needs its whole 0.6–0.7 GB zip), and TUM-VI CSVs by `tools/fetch_tumvi.py` (range reads into the uncompressed tar). `degrade_imu.py` is the organizers' script from the Track 3 student package.
 
 ```bash
 python tools/make_official_runs.py euroc/V1_02_medium runs_official --script degrade_imu.py --modes euroc accelfirst direct --levels 1.0 0.6 --gammas 1.7 1.0
@@ -135,7 +156,7 @@ CI (`.github/workflows/ci.yml`) runs the contract tests on Ubuntu and Windows. O
 
 ## Known limitations
 
-- Validated on two Vicon-room flights from one vehicle. Machine Hall and handheld TUM-VI sequences are untested. The drag gain is specific to the EuRoC vehicle, and the multirotor detector switches drag off for non-multirotor data.
-- IMU-only position is about 18–21% better than stand-still on these flights, but still metre-level in absolute terms.
+- Validated on four real sequences (three EuRoC flights, one handheld TUM-VI). Fast TUM-VI sequences (corridor, outdoors) and the other Machine Hall flights are untested. The drag gain is specific to the EuRoC vehicle; the vibration and spread detectors switch drag off for non-multirotor data.
+- IMU-only position is 17–21% better than stand-still on these sequences, but still metre-level in absolute terms (about 5.6 m on the large Machine Hall).
 - If the evaluation data's gyro is in deg/s without a header saying so, pass `--gyro-deg`. That can't be detected reliably from the data alone.
 - The smoother needs about 110 bytes of temp disk per IMU sample (20 MB for 30 minutes). If no temp directory is writable, it falls back to a causal single pass with a warning.

@@ -54,6 +54,13 @@ The design is a streaming complementary filter. It reads one row, updates the st
 
    An impulsive spike is replaced by the last accepted value when it jumps more than `k ×` the channel's running difference-noise. Timestamp gaps over 2.5 × the nominal period are bridged by blind propagation. Duplicate or out-of-order stamps keep the previous pose.
 2. **Gravity alignment and bias at start.** The first second of data sets the initial roll and pitch from the shortest rotation that takes the mean accelerometer vector to +z. If the platform is static, it also sets the gyro bias and local |g|. Rows further than the spike thresholds from the per-channel median are left out first, so a single spike in that second can't void the static test and leave the bias uncalibrated for the whole flight. This handles the "unknown gravity alignment": no IMU mounting is assumed.
+
+   **If the recording doesn't start at rest** (EuRoC MH_04, for example), an offline pre-pass scans the whole file for the quietest 1 s window and takes the gyro bias and local |g| from it. The window counts as rest only if three conditions hold:
+   - the gyro is white noise around its mean: the four sub-window means agree within 3× the noise expectation;
+   - the gravity direction moves less than 0.25°;
+   - |f| is close to g and steady.
+
+   This finds the true bias on every EuRoC run (to about 0.002 rad/s, even with `direct`-mode gyro noise), and correctly finds nothing on hand-held TUM-VI, which is never still and whose bias is already compensated. The pre-pass reads the file a second time with a 200-sample ring buffer.
 3. **Attitude.** Exact quaternion exponential integration of the bias-corrected gyro. A gravity correction (Mahony-style), weighted by `exp(-((|a|-g)/0.15g)²)`, runs while the platform is static. In motion it is off by default (`kp=0`): on a multirotor the accelerometer points along thrust, so tilting the attitude toward the accelerometer erases the very tilt that encodes horizontal acceleration. Tuning confirmed this. For handheld data, `--set kp=0.02` can be tried.
 4. **Static segment and ZUPT.** Static detection uses the gyro energy and the deviation of |a| from g, with thresholds that grow with the noise estimate. While static: velocity → 0, gyro bias ← mean gyro, accel bias ← residual, and the gravity correction is stiffened. By default this applies **only to the initial static segment** (`static_hold_s=1e9`). On real EuRoC data, rotor vibration made slow flight pass the in-flight static test for 10.6 s, and each detection pulled the gyro bias toward the real rotation rate (2.6°/s rotation error). Calibrating once at start-up gives 0.46°/s, the same as an oracle that knows the true bias. For handheld data with real pauses, `--set static_hold_s=0.3` re-enables in-flight ZUPT.
 5. **Translation as band-pass double integration.** The steps are:
@@ -69,9 +76,13 @@ The design is a streaming complementary filter. It reads one row, updates the st
    - Lateral force is taken in the plane perpendicular to it, with a tracked offset removed, then low-passed.
    - The drag velocity is `drag_gain · f_lateral`. The gain (−2.45 s) was fitted on EuRoC V1_01 ground truth; a larger gain looked better on V1_01 but worse on the held-out V1_02, so it was rejected. The low-pass is 0.6 s. With the final fusion settings, drag is worth about 21% of the objective on V1_01.
    - The velocity leak pulls toward this drag velocity instead of toward zero.
-   - A **multirotor detector** gates it. On a multirotor the specific force stays within about 5° (rms) of the thrust axis; handheld motion swings it by tens of degrees. The gate is fully on below 8° and off above 15°. Gate closed means exactly the plain filter.
+   - Two **multirotor detectors** gate it, and both must agree:
+     - **Specific-force spread:** on a multirotor the specific force stays within about 5° (rms) of the thrust axis. The gate is fully on below 8° and off above 15°.
+     - **Rotor vibration:** sample-to-sample accelerometer energy is at least 1.4 m/s² on a multirotor in flight, but under 0.4 for a hand-held device even at maximum official degradation. The gate is fully on above 1.2 and off below 0.8.
+
+     The spread test alone was fooled on TUM-VI (a phone held roughly level), where drag made ATE 74% *worse* than standing still; with the vibration gate it's 17.5% better. Gate closed means exactly the plain filter.
    - Self-calibrating the gain online was tried and rejected: the integrated velocity it would calibrate against tracks true velocity worse than drag itself does.
-7. **Dead reckoning (dropouts and post-failure).** With no valid measurement, the state is extrapolated from the last smoothed velocity and body rate, each decaying exponentially (`τ_vb`=0.5 s, `τ_wb`=0.1 s). This is the same code path for a single dropped frame, the 2-second signal loss and the final 5-second blind segment. When data comes back, integration resumes from the dead-reckoned state with no reset jump.
+7. **Dead reckoning (dropouts and post-failure).** With no valid measurement, the state is extrapolated from the last smoothed velocity and body rate, each decaying exponentially (`τ_vb`=0.25 s, `τ_wb`=0.1 s). The short velocity memory was the best average over four sequences: the velocity estimate at failure is at its noisiest. This is the same code path for a single dropped frame, the 2-second signal loss and the final 5-second blind segment. When data comes back, integration resumes from the dead-reckoned state with no reset jump.
 8. **Offline two-pass smoothing (default).** The track is offline, so each estimate can use future samples as well as past ones.
    - The forward pass above streams one fixed-size record per filter step: dt, gravity-free world acceleration, drag target velocity, and static and drag flags. It also writes one per output row: timestamp, attitude, shrink factor and forward position. All of this goes to a temp file.
    - Pass B1 integrates velocity forward. Pass B2 reads the file **backwards**, integrating velocity backward in time, averaging it with the forward velocity, and integrating position backward. Pass C integrates position forward, averages it with the backward position, and writes the poses.
@@ -85,8 +96,8 @@ Measured on Windows 11 with Python 3.11 on real EuRoC flights degraded with `deg
 
 | Budget | Limit | Measured |
 |---|---|---|
-| Peak RAM (heap: data structures, buffers, estimation) | ≤ 8 MB | **1.6–2.0 MB**, constant in sequence length (streaming) |
-| Compute per 1 s of IMU | ≤ 20 ms | **2.4–2.5 ms** |
+| Peak RAM (heap: data structures, buffers, estimation) | ≤ 8 MB | **1.6–1.9 MB**, constant in sequence length (streaming) |
+| Compute per 1 s of IMU | ≤ 20 ms | **2.4–3.3 ms** (3.3 when the rest-window pre-pass runs) |
 | Threads | 1 | 1 |
 
 ## Validation tools (`tools/`)
@@ -98,6 +109,7 @@ Measured on Windows 11 with Python 3.11 on real EuRoC flights degraded with `deg
 | `tune.py` | Coordinate-descent parameter tuning on train seeds, reported on held-out seeds. |
 | `benchmark.py` | Runtime per IMU-second, Python heap peak and whole-process peak RSS. |
 | `fetch_euroc.py` | Fetches only the IMU and ground-truth CSVs of a EuRoC sequence (HTTP range requests, or a streamed inflate for nested zips). |
+| `fetch_tumvi.py` | Range-reads the IMU and mocap CSVs out of a TUM-VI EuRoC-format tar (no index: scans tar headers backwards, with a size cap). |
 | `make_official_runs.py` | Applies the organizers' `degrade_imu.py` to a real EuRoC flight in three input modes, writing ground truth and metadata for `evaluate.py`. |
 | `degrade_real.py` | My own degradation model applied to real EuRoC data (used before the official script was released). |
 | `eval_runs.py` | Scores a folder of runs against the stand-still and raw-strapdown baselines. |
