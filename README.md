@@ -43,8 +43,8 @@ Then zip the bundle as `team_name.zip`, using your registered `CollegeName_TeamN
 | Dropouts are missing rows | Timestamp gaps are bridged by dead reckoning; every remaining row gets its pose |
 | Estimate from the IMU file only | No other input is read |
 | Offline; future samples may be used | Two-pass zero-phase smoother (see `src/README.md`) |
-| ≤ 8 MB peak RAM, **measured at heap level** | **1.6–1.9 MB** heap peak (tracemalloc), constant in sequence length |
-| ≤ 20 ms compute per 1 s of IMU, one thread | **2.4–3.3 ms** per IMU-second, single thread (the upper figure includes the rest-window pre-pass) |
+| ≤ 8 MB peak RAM, **measured at heap level** | **0.45–0.52 MB** heap peak (tracemalloc), constant in sequence length |
+| ≤ 20 ms compute per 1 s of IMU, one thread | **2.3–2.7 ms** per IMU-second, single thread (the upper figure includes the rest-window pre-pass) |
 | SE(3)-aligned ATE and RPE (evo) | Output frame: z-up, gravity aligned, starting at the origin |
 
 ### Input formats handled
@@ -98,6 +98,8 @@ Four real sequences covering both datasets the jury uses: two Vicon-room flights
 Values are means over the runs in each group, in metres except rotation. **Every group beats the stand-still baseline by 17.5–21.2%.** ATE is the RMSE after SE(3) alignment, the same as `evo_ape -a`. The stand-still baseline is a trajectory that never moves, the honest bar for IMU-only estimation; raw double integration of the same data is 132–1,511 m off. Ground truth is the EuRoC state estimate or the TUM-VI motion capture on every IMU stamp, excluding stamps inside mocap dropouts (TUM-VI has gaps of up to 1 s).
 
 **What was fitted where.** The smoother, shrinkage and drag parameters were selected on V1_01 alone and confirmed on V1_02. MH_04 and TUM-VI were brought in as unseen data. They exposed the two bugs described below, whose fixes are general detectors with physically motivated thresholds, not fitted parameters. The one parameter chosen across all four sequences is the blind-segment velocity decay (0.25 s). So MH_04 and TUM-VI are no longer pure holdouts, and the next validation step would be another unseen sequence (for example MH_05 or TUM-VI room2).
+
+**Leave-one-sequence-out check of the position parameters.** The smoother's position prior (`tau_ps`) and velocity fusion (`tau_vs`) were re-swept on all four sequences, which disagree: the Vicon room wants a tighter prior, the large hall a looser one. For each sequence, parameters chosen on the other three made the held-out sequence **worse in 3 of 4 cases (+8% to +16% objective)**, while the current values (`tau_ps` 15 s, `tau_vs` 0.75 s) are the best single choice across all four. They sit in the robust middle and are kept; re-tuning per dataset would overfit.
 
 ### How it got there
 

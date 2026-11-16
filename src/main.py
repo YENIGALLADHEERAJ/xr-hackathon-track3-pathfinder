@@ -559,7 +559,10 @@ def open_imu_csv(path):
 
 
 G0 = 9.80665
+_isfinite = math.isfinite
 SAMPLE_ROWS = 400                    # rows buffered to detect the input format
+IO_CHUNK = 512                       # records per read/write batch in the smoother passes
+LINE_BUF = 256                       # output lines / forward records buffered before a write
 
 
 def _split_lines(stream):
@@ -678,8 +681,8 @@ class InputFormat:
         meas = None
         if len(parts) >= 7:
             try:
-                v = tuple(float(x) for x in parts[1:7])
-                if all(math.isfinite(x) for x in v):
+                v = tuple(map(float, parts[1:7]))
+                if all(map(_isfinite, v)):
                     meas = v
             except ValueError:
                 meas = None
@@ -796,8 +799,9 @@ def open_rows(stream, gyro_deg=False):
     fmt = InputFormat(header, sample, gyro_deg)
 
     def gen():
-        for parts in sample:
-            r = fmt.row(parts)
+        sample.reverse()                    # pop() from the end = original order,
+        while sample:                       # and the detection sample is freed as it goes
+            r = fmt.row(sample.pop())
             if r is not None:
                 yield r
         for kind, payload in it:
@@ -829,7 +833,7 @@ V6 = struct.Struct("<6d")
 STEP, BLIND, ROW = 0, 1, 2
 
 
-def _read_fwd(f, st, chunk=4096):
+def _read_fwd(f, st, chunk=IO_CHUNK):
     f.seek(0)
     n = st.size
     while True:
@@ -840,7 +844,7 @@ def _read_fwd(f, st, chunk=4096):
             yield st.unpack_from(data, i)
 
 
-def _read_bwd(f, st, chunk=4096):
+def _read_bwd(f, st, chunk=IO_CHUNK):
     f.seek(0, 2)
     end = f.tell()
     n = st.size
@@ -890,7 +894,7 @@ def _smooth(t1_path, tmpdir, out, prm, k_last):
                 if r[0] != ROW:
                     v = _vstep(v, r, 1.0, prm)
                     buf.append(V3.pack(v[0], v[1], v[2]))
-                    if len(buf) >= 4096:
+                    if len(buf) >= IO_CHUNK:
                         f2.write(b"".join(buf))
                         buf.clear()
             f2.write(b"".join(buf))
@@ -912,7 +916,7 @@ def _smooth(t1_path, tmpdir, out, prm, k_last):
                 vz = 0.5 * (vf[2] + vb[2])
                 pb = [(pb[0] - vx * dt) * lp, (pb[1] - vy * dt) * lp, (pb[2] - vz * dt) * lp]
                 buf.append(V6.pack(vx, vy, vz, pb[0], pb[1], pb[2]))
-                if len(buf) >= 4096:
+                if len(buf) >= IO_CHUNK:
                     f3.write(b"".join(buf))
                     buf.clear()
             f3.write(b"".join(buf))
@@ -946,7 +950,7 @@ def _smooth(t1_path, tmpdir, out, prm, k_last):
                     pz = ps_fail[2] + r[11] - pos_ref[2]
                 lines.append("%s %.6f %.6f %.6f %.9f %.9f %.9f %.9f\n" % (
                     fmt_ts(r[3]), px * beta, py * beta, pz * beta, r[4], r[5], r[6], r[7]))
-                if len(lines) >= 2000:
+                if len(lines) >= LINE_BUF:
                     out.write("".join(lines))
                     lines.clear()
             out.write("".join(lines))
@@ -1042,7 +1046,7 @@ def run(inp, out_path, prm, extrapolate=False, gyro_deg=False):
             run_start = None
             trailing_invalid_ns = 0
         last_ts = ts
-        if len(buf) >= 2000:
+        if len(buf) >= LINE_BUF:
             flush()
 
     for ts, m in head:
@@ -1060,7 +1064,7 @@ def run(inp, out_path, prm, extrapolate=False, gyro_deg=False):
             ts = last_ts + k * dt_nom_ns
             est.update(ts, None)
             emit(ts)
-            if len(buf) >= 2000:
+            if len(buf) >= LINE_BUF:
                 flush()
     flush()
     if smooth:

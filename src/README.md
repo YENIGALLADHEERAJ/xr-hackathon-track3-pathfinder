@@ -96,8 +96,8 @@ Measured on Windows 11 with Python 3.11 on real EuRoC flights degraded with `deg
 
 | Budget | Limit | Measured |
 |---|---|---|
-| Peak RAM (heap: data structures, buffers, estimation) | ≤ 8 MB | **1.6–1.9 MB**, constant in sequence length (streaming) |
-| Compute per 1 s of IMU | ≤ 20 ms | **2.4–3.3 ms** (3.3 when the rest-window pre-pass runs) |
+| Peak RAM (heap: data structures, buffers, estimation) | ≤ 8 MB | **0.45–0.52 MB**, constant in sequence length (streaming; I/O in 256–512-record batches) |
+| Compute per 1 s of IMU | ≤ 20 ms | **2.3–2.7 ms** (the upper figure when the rest-window pre-pass runs) |
 | Threads | 1 | 1 |
 
 ## Validation tools (`tools/`)
