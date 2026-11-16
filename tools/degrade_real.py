@@ -74,6 +74,7 @@ def main():
     P = gt[k, 1:4] * (1 - al[:, None]) + gt[k + 1, 1:4] * al[:, None]
     Q = slerp(gt[k, 4:8], gt[k + 1, 4:8], al)          # (w, x, y, z)
     Q[Q[:, 0] < 0] *= -1
+    gt_ok = (gts[k + 1] - gts[k]) <= 50_000_000          # skip ground truth inside mocap dropouts
 
     # ---- degradation ----
     keep = np.ones(n, bool)
@@ -120,6 +121,8 @@ def main():
     with open(os.path.join(a.out, "groundtruth.txt"), "w", newline="\n") as fh:
         fh.write("# timestamp tx ty tz qx qy qz qw\n")
         for i in range(n):
+            if not gt_ok[i]:
+                continue
             fh.write("%d.%09d %.6f %.6f %.6f %.9f %.9f %.9f %.9f\n" % (
                 ts[i] // 10 ** 9, ts[i] % 10 ** 9, *P[i], Q[i, 1], Q[i, 2], Q[i, 3], Q[i, 0]))
     t0 = float(ts[0]) * 1e-9

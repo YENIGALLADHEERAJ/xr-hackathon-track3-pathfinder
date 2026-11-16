@@ -65,7 +65,7 @@ DEFAULTS = dict(
     tau_aw=5.0,          # world-frame acceleration mean removal [s]
     tau_v=1.0,           # velocity leak / drag-fusion time constant [s]
     tau_p=5.0,           # position prior (leak to origin) time constant [s]
-    tau_vb=0.5,          # velocity decay during blind dead reckoning [s]
+    tau_vb=0.25,         # velocity decay during blind dead reckoning [s]
     tau_wb=0.1,          # angular-rate decay during blind dead reckoning [s]
     gap_factor=2.5,      # dt > gap_factor * nominal -> dropout
     spike_k=8.0,         # spike gate: k * diff-noise + floor
@@ -84,6 +84,13 @@ DEFAULTS = dict(
     spread_lo=0.14,      # rms angle f vs thrust axis [rad] below which drag is fully on (8 deg)
     spread_hi=0.26,      # ... above which it is off (15 deg)
     drag_warm=15.0,      # seconds of motion before drag can engage
+    vib_lo=0.8,          # accel vibration [m/s^2] below which drag is off (handheld)
+    vib_hi=1.2,          # ... above which it is fully on (rotors spinning)
+    rest_search=1.0,     # 1 = if the start is not static, take the gyro bias from the
+                         # quietest 1 s window anywhere in the file (offline pre-pass)
+    rest_gyro_std=0.05,  # max mean per-axis gyro std [rad/s] for a window to count as rest
+    rest_ratio=3.0,      # max sub-window-mean spread / white-noise expectation (rest test)
+    rest_tilt_deg=0.25,  # max gravity-direction change between sub-windows (rest test) [deg]
     # --- offline two-pass smoothing (the file is complete before output is due) ---
     smooth=1.0,          # 1 = forward-backward (zero-phase) velocity/position smoothing
     tau_vs=0.75,         # smoother velocity leak / drag-fusion time constant [s]
@@ -435,6 +442,12 @@ class PathFinder:
                 lo, hi = p["spread_lo"], p["spread_hi"]
                 gk = (hi - ang) / (hi - lo)
                 gate = 0.0 if gk < 0.0 else (1.0 if gk > 1.0 else gk)
+                # rotor vibration: multirotor IMUs show >= 1.4 m/s^2 of sample-to-sample
+                # accelerometer energy in flight, handheld devices < 0.4 even under the
+                # official degradation; without vibration the drag model does not apply
+                vib = math.sqrt(self.na) if self.na > 0.0 else 0.0
+                gv = (vib - p["vib_lo"]) / (p["vib_hi"] - p["vib_lo"])
+                gate *= 0.0 if gv < 0.0 else (1.0 if gv > 1.0 else gv)
                 if self.t_drag < p["drag_warm"]:
                     gate = 0.0
                 self.gate = gate
@@ -682,6 +695,91 @@ class InputFormat:
         return ts, meas
 
 
+def find_rest(inp, gyro_deg, dt_nom_ns, prm, n=200, step=50):
+    """Offline pre-pass: the quietest window of n consecutive valid samples
+    (lowest mean per-axis gyro std, |f| close to g and steady).  Returns
+    (gyro_mean, |f| mean, gyro_std) or None if no window is at rest.
+    O(n) memory (a ring of the last n samples)."""
+    _, rows = open_rows(open_imu_csv(inp), gyro_deg)
+    ring = [None] * n
+    cnt = 0
+    last_ts = None
+    since = 0
+    best = None
+    gmax = 2.5 * dt_nom_ns
+    for ts, m in rows:
+        bad = m is None or (m[3] == 0.0 and m[4] == 0.0 and m[5] == 0.0)
+        if bad or (last_ts is not None and (ts - last_ts > gmax or ts <= last_ts)):
+            cnt = 0                                   # windows never span invalid rows or gaps
+            since = 0
+            last_ts = None if bad else ts
+            if bad:
+                continue
+        last_ts = ts
+        ring[cnt % n] = m
+        cnt += 1
+        since += 1
+        if cnt < n or since < step:
+            continue
+        since = 0
+        sw = [0.0] * 3
+        sw2 = [0.0] * 3
+        sf = sf2 = 0.0
+        for v in ring:
+            for i in range(3):
+                sw[i] += v[i]
+                sw2[i] += v[i] * v[i]
+            fn = math.sqrt(v[3] * v[3] + v[4] * v[4] + v[5] * v[5])
+            sf += fn
+            sf2 += fn * fn
+        mean = [x / n for x in sw]
+        sd = [math.sqrt(max(sw2[i] / n - mean[i] * mean[i], 0.0)) for i in range(3)]
+        std = sum(sd) / 3.0
+        fm = sf / n
+        fs = math.sqrt(max(sf2 / n - fm * fm, 0.0))
+        if abs(fm - 9.81) > 0.5 or fs > 0.3:
+            continue
+        # at rest the gyro is white noise around the bias: the means of 4 sub-windows
+        # agree to ~std/sqrt(n/4).  Hand tremor or slow rotation makes them wander
+        # (TUM-VI handheld: same std as a noisy rest window, but a wrong "bias").
+        q = n // 4
+        ratio = 0.0
+        for i in range(3):
+            subs = []
+            for k in range(4):
+                s_ = 0.0
+                for j in range(k * q, (k + 1) * q):
+                    s_ += ring[(cnt + j) % n][i]          # oldest-to-newest order
+                subs.append(s_ / q)
+            mu = sum(subs) / 4.0
+            spread_ = math.sqrt(sum((x - mu) ** 2 for x in subs) / 3.0)
+            ratio += spread_ / (sd[i] / math.sqrt(q) + 1e-9) / 3.0
+        if ratio > prm["rest_ratio"]:
+            continue
+        # ... and the gravity direction does not move: sub-window mean specific
+        # forces must agree in direction (a hand-held device tilts by tenths of a
+        # degree per second; sensor noise averages to ~0.01 deg over 50 samples)
+        dirs = []
+        for k in range(4):
+            a = [0.0, 0.0, 0.0]
+            for j in range(k * q, (k + 1) * q):
+                v = ring[(cnt + j) % n]
+                a[0] += v[3]
+                a[1] += v[4]
+                a[2] += v[5]
+            na_ = math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+            dirs.append((a[0] / na_, a[1] / na_, a[2] / na_))
+        cmin = min(sum(dirs[k1][i] * dirs[k2][i] for i in range(3))
+                   for k1 in range(4) for k2 in range(k1 + 1, 4))
+        if math.degrees(math.acos(max(-1.0, min(1.0, cmin)))) > prm["rest_tilt_deg"]:
+            continue
+        if best is None or std < best[2]:
+            best = (mean, fm, std)
+    if best is None or best[2] > prm["rest_gyro_std"]:
+        return None
+    return best
+
+
 def open_rows(stream, gyro_deg=False):
     """Detect the input format from the first SAMPLE_ROWS rows, then yield
     (ts_ns, meas|None) for every data row (O(1) memory)."""
@@ -878,6 +976,12 @@ def run(inp, out_path, prm, extrapolate=False, gyro_deg=False):
                    if head[i + 1][0] > head[i][0])
     dt_nom_ns = diffs[len(diffs) // 2] if diffs else 5000000
     est.initialise([m for _, m in head if m is not None], dt_nom_ns * 1e-9)
+    rest = None
+    if prm["rest_search"] > 0.0 and not getattr(est, "init_static", False):
+        rest = find_rest(inp, gyro_deg, dt_nom_ns, prm)
+        if rest is not None:                          # gyro bias (and local g) from a rest window
+            est.bg = list(rest[0])
+            est.g = rest[1]
 
     out = open(out_path, "w", newline="\n")
     out.write("# timestamp tx ty tz qx qy qz qw\n")
@@ -983,6 +1087,8 @@ def run(inp, out_path, prm, extrapolate=False, gyro_deg=False):
         drag_final_gate=round(est.gate, 3),
         smoothing="two-pass zero-phase" if smooth else "causal (single pass)",
         input_format=fmt.describe(),
+        gyro_bias_source=("initial static segment" if getattr(est, "init_static", False) else
+                          ("rest window (gyro std %.4f rad/s)" % rest[2] if rest is not None else "none found")),
         runtime_s=round(elapsed, 4),
         runtime_ms_per_imu_second=round(1000.0 * elapsed / span, 3) if span > 0 else None,
         threads=1,

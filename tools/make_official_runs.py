@@ -96,6 +96,8 @@ def main():
     P = gt[k, 1:4] * (1 - al[:, None]) + gt[k + 1, 1:4] * al[:, None]
     Q = slerp(gt[k, 4:8], gt[k + 1, 4:8], al)
     Q[Q[:, 0] < 0] *= -1
+    # never interpolate ground truth across mocap dropouts (TUM-VI has gaps up to ~1 s)
+    gt_ok = (gts[k + 1] - gts[k]) <= 50_000_000
     t0 = ts[0] * 1e-9
     T = (ts[-1] - ts[0]) * 1e-9
     tag = a.tag or os.path.basename(os.path.normpath(a.seq)).split("_")[0] + os.path.basename(
@@ -136,6 +138,8 @@ def main():
                 with open(os.path.join(d, "groundtruth.txt"), "w", newline="\n") as fh:
                     fh.write("# timestamp tx ty tz qx qy qz qw\n")
                     for i in range(len(ts)):
+                        if not gt_ok[i]:                 # inside a ground-truth (mocap) dropout: unscored
+                            continue
                         fh.write("%d.%09d %.6f %.6f %.6f %.9f %.9f %.9f %.9f\n" % (
                             ts[i] // 10 ** 9, ts[i] % 10 ** 9, *P[i], Q[i, 1], Q[i, 2], Q[i, 3], Q[i, 0]))
                 # dropout window = the largest timestamp gap before failure (+3 s after)
