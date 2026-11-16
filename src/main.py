@@ -38,7 +38,9 @@ alignment `-a` maps between them.)
 """
 
 import argparse
+import decimal
 import io
+import itertools
 import json
 import math
 import os
@@ -49,8 +51,8 @@ import time
 import zipfile
 
 # --------------------------------------------------------------------------
-# Tunable parameters. Selected on real EuRoC V1_01 (7 degradation variants) +
-# synthetic runs, confirmed on the held-out V1_02 flight. kp/ki = 0: on a
+# Tunable parameters. Selected on real EuRoC V1_01 degraded with the organizers'
+# degrade_imu.py (13 runs, 3 input modes), confirmed on held-out V1_02. kp/ki = 0: on a
 # multirotor the accelerometer points along thrust, not gravity, so tilt
 # correction toward it hurts.
 # --------------------------------------------------------------------------
@@ -63,7 +65,7 @@ DEFAULTS = dict(
     tau_aw=5.0,          # world-frame acceleration mean removal [s]
     tau_v=1.0,           # velocity leak / drag-fusion time constant [s]
     tau_p=5.0,           # position prior (leak to origin) time constant [s]
-    tau_vb=2.0,          # velocity decay during blind dead reckoning [s]
+    tau_vb=0.5,          # velocity decay during blind dead reckoning [s]
     tau_wb=0.1,          # angular-rate decay during blind dead reckoning [s]
     gap_factor=2.5,      # dt > gap_factor * nominal -> dropout
     spike_k=8.0,         # spike gate: k * diff-noise + floor
@@ -71,21 +73,21 @@ DEFAULTS = dict(
                          # initial static segment: on real EuRoC, rotor vibration made
                          # slow flight look static and corrupted the gyro bias
     horizon_s=5.0,       # post-failure dead-reckoning horizon [s]
-    shrink_gamma=1.0,    # position shrinkage exponent vs. noise growth (0 = off)
+    shrink_gamma=0.0,    # position shrinkage exponent vs. noise growth (0 = off)
     # --- rotor-drag velocity aiding (multirotors), gated by a multirotor detector ---
     drag=1.0,            # 1 = enabled (detector keeps it off on non-multirotor data)
     drag_gain=-2.45,     # velocity per unit lateral specific force [s] = -1/k (EuRoC Firefly)
     tau_n=20.0,          # thrust-axis tracking [s]
     tau_c=30.0,          # lateral specific-force offset tracking [s]
-    tau_fd=0.3,          # low-pass of lateral specific force [s]
+    tau_fd=0.6,          # low-pass of lateral specific force [s]
     tau_spread=5.0,      # multirotor detector averaging [s]
     spread_lo=0.14,      # rms angle f vs thrust axis [rad] below which drag is fully on (8 deg)
     spread_hi=0.26,      # ... above which it is off (15 deg)
     drag_warm=15.0,      # seconds of motion before drag can engage
     # --- offline two-pass smoothing (the file is complete before output is due) ---
     smooth=1.0,          # 1 = forward-backward (zero-phase) velocity/position smoothing
-    tau_vs=4.0,          # smoother velocity leak / drag-fusion time constant [s]
-    tau_ps=30.0,         # smoother position prior time constant [s]
+    tau_vs=0.75,         # smoother velocity leak / drag-fusion time constant [s]
+    tau_ps=15.0,         # smoother position prior time constant [s]
     tau_vbs=2.0,         # smoother velocity decay across measurement gaps [s]
 )
 
@@ -543,28 +545,169 @@ def open_imu_csv(path):
     return open(path, "r", newline="")
 
 
-def parse_rows(stream):
-    """Yield (ts_ns:int, meas:tuple|None). Rows without a usable timestamp are skipped."""
-    isfinite = math.isfinite
+G0 = 9.80665
+SAMPLE_ROWS = 400                    # rows buffered to detect the input format
+
+
+def _split_lines(stream):
+    """Yield (kind, payload): ('hdr', text) for header/comment lines, ('row', parts)
+    for rows whose first field is numeric."""
     for line in stream:
         s = line.strip()
-        if not s or s[0] == "#":
+        if not s:
+            continue
+        if s[0] == "#":
+            yield "hdr", s
             continue
         parts = s.split(",")
+        t = parts[0].strip()
         try:
-            t = parts[0].strip()
-            ts = int(t) if t.isdigit() else int(float(t))
+            float(t)
         except ValueError:
-            continue                                   # header or garbage line
+            yield "hdr", s                         # header without '#', or garbage
+            continue
+        yield "row", parts
+
+
+def _median(v):
+    v = sorted(v)
+    return v[len(v) // 2] if v else 0.0
+
+
+class InputFormat:
+    """Detected from the data (header names are only cross-checked):
+    * timestamp unit from the median sample spacing (s / ms / us / ns, the same
+      thresholds as the organizers' degrade_imu.py), converted exactly to ns
+    * column order: the accelerometer triplet is the one whose median norm is
+      ~1 g; EuRoC is gyro-first, degrade_imu.py documents accel-first
+    * accelerometer in g (median norm 0.5-2) is converted to m/s^2
+    * gyro in deg/s only when the header says so or --gyro-deg is given"""
+
+    def __init__(self, header_lines, sample, gyro_deg=False):
+        ts = []
+        for parts in sample:
+            try:
+                ts.append(float(parts[0]))
+            except ValueError:
+                pass
+        dts = [ts[i + 1] - ts[i] for i in range(len(ts) - 1) if ts[i + 1] > ts[i]]
+        dt = _median(dts) if dts else 5e6
+        if dt < 1.0:
+            self.ts_unit, self.ts_exp = "s", 9
+        elif dt < 1e3:
+            self.ts_unit, self.ts_exp = "ms", 6
+        elif dt < 1e6:
+            self.ts_unit, self.ts_exp = "us", 3
+        else:
+            self.ts_unit, self.ts_exp = "ns", 0
+        n1, n2 = [], []
+        for parts in sample:
+            if len(parts) < 7:
+                continue
+            try:
+                v = [float(x) for x in parts[1:7]]
+            except ValueError:
+                continue
+            if not all(math.isfinite(x) for x in v):
+                continue
+            a1 = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+            a2 = math.sqrt(v[3] * v[3] + v[4] * v[4] + v[5] * v[5])
+            if a1 == 0.0 and a2 == 0.0:
+                continue
+            n1.append(a1)
+            n2.append(a2)
+        m1, m2 = _median(n1), _median(n2)
+        self.accel_first = m1 > m2                  # default (tie / no data): EuRoC gyro-first
+        acc_norm = m1 if self.accel_first else m2
+        self.accel_g = 0.5 < acc_norm < 2.0
+        self.acc_scale = G0 if self.accel_g else 1.0
+        hdr = " ".join(header_lines).lower()
+        self.header_order = None
+        names = [h.strip().lower() for h in (header_lines[-1].split(",") if header_lines else [])]
+        if len(names) >= 7:
+            def kind(nm):
+                if "w_" in nm or "gyr" in nm or nm.startswith("g") or "omega" in nm:
+                    return "g"
+                if "a_" in nm or "acc" in nm or nm.startswith("a"):
+                    return "a"
+                return "?"
+            k1, k2 = kind(names[1]), kind(names[4])
+            if (k1, k2) == ("g", "a"):
+                self.header_order = "gyro_first"
+            elif (k1, k2) == ("a", "g"):
+                self.header_order = "accel_first"
+        self.gyro_deg = gyro_deg or ("deg" in hdr and ("w_" in hdr or "gyr" in hdr))
+        self.gyr_scale = math.pi / 180.0 if self.gyro_deg else 1.0
+        self.identity = (self.ts_exp == 0 and not self.accel_first and not self.accel_g
+                         and not self.gyro_deg)
+
+    def describe(self):
+        order = "accel_first" if self.accel_first else "gyro_first"
+        return dict(timestamp_unit=self.ts_unit, column_order=order,
+                    accel_unit="g" if self.accel_g else "m/s^2",
+                    gyro_unit="deg/s" if self.gyro_deg else "rad/s",
+                    header_order=self.header_order,
+                    header_agrees=None if self.header_order is None else self.header_order == order)
+
+    def ts_ns(self, tok):
+        tok = tok.strip()
+        if self.ts_exp == 0 and tok.isdigit():
+            return int(tok)
+        d = decimal.Decimal(tok).scaleb(self.ts_exp)
+        return int(d.to_integral_value(rounding=decimal.ROUND_HALF_EVEN))
+
+    def row(self, parts):
+        """-> (ts_ns, meas|None) with meas = (wx, wy, wz, ax, ay, az) in rad/s, m/s^2."""
+        try:
+            ts = self.ts_ns(parts[0])
+        except (ValueError, decimal.InvalidOperation):
+            return None
         meas = None
         if len(parts) >= 7:
             try:
-                vals = tuple(float(x) for x in parts[1:7])
-                if all(isfinite(x) for x in vals):
-                    meas = vals
+                v = tuple(float(x) for x in parts[1:7])
+                if all(math.isfinite(x) for x in v):
+                    meas = v
             except ValueError:
                 meas = None
-        yield ts, meas
+        if meas is not None and not self.identity:
+            if self.accel_first:
+                meas = meas[3:6] + meas[0:3]
+            if self.gyro_deg:
+                k = self.gyr_scale
+                meas = (meas[0] * k, meas[1] * k, meas[2] * k) + meas[3:6]
+            if self.accel_g:
+                k = self.acc_scale
+                meas = meas[0:3] + (meas[3] * k, meas[4] * k, meas[5] * k)
+        return ts, meas
+
+
+def open_rows(stream, gyro_deg=False):
+    """Detect the input format from the first SAMPLE_ROWS rows, then yield
+    (ts_ns, meas|None) for every data row (O(1) memory)."""
+    it = _split_lines(stream)
+    header, sample = [], []
+    for kind, payload in it:
+        if kind == "hdr":
+            if not sample:
+                header.append(payload)
+            continue
+        sample.append(payload)
+        if len(sample) >= SAMPLE_ROWS:
+            break
+    fmt = InputFormat(header, sample, gyro_deg)
+
+    def gen():
+        for parts in sample:
+            r = fmt.row(parts)
+            if r is not None:
+                yield r
+        for kind, payload in it:
+            if kind == "row":
+                r = fmt.row(payload)
+                if r is not None:
+                    yield r
+    return fmt, gen()
 
 
 def fmt_ts(ts):
@@ -711,11 +854,14 @@ def _smooth(t1_path, tmpdir, out, prm, k_last):
             out.write("".join(lines))
 
 
-def run(inp, out_path, prm, extrapolate=True):
+def run(inp, out_path, prm, extrapolate=False, gyro_deg=False):
+    """extrapolate=False (default, as the Track 3 FAQ requires): exactly one pose
+    per input row; the blind segment's rows are present with invalid values and
+    are dead-reckoned in place."""
     t0 = time.perf_counter()
     est = PathFinder(prm)
     stream = open_imu_csv(inp)
-    rows = parse_rows(stream)
+    fmt, rows = open_rows(stream, gyro_deg)
 
     # ---- buffer the first init_s seconds for alignment ----
     head = []
@@ -784,7 +930,7 @@ def run(inp, out_path, prm, extrapolate=True):
         est.update(ts, m)
         emit(ts)
         n_out += 1
-        if m is None:
+        if m is None or (m[3] == 0.0 and m[4] == 0.0 and m[5] == 0.0):   # invalid (NaN / zero rows)
             if run_start is None:
                 run_start = last_ts if last_ts is not None else ts
             trailing_invalid_ns = ts - run_start
@@ -836,6 +982,7 @@ def run(inp, out_path, prm, extrapolate=True):
         drag_active_s=round(est.drag_gate_time, 3),
         drag_final_gate=round(est.gate, 3),
         smoothing="two-pass zero-phase" if smooth else "causal (single pass)",
+        input_format=fmt.describe(),
         runtime_s=round(elapsed, 4),
         runtime_ms_per_imu_second=round(1000.0 * elapsed / span, 3) if span > 0 else None,
         threads=1,
@@ -847,8 +994,11 @@ def main(argv=None):
     ap.add_argument("input", help="imu0/data.csv, a EuRoC sequence directory or a .zip")
     ap.add_argument("-o", "--output", default="estimated_trajectory.txt")
     ap.add_argument("--metadata", default=None, help="write run statistics as JSON")
-    ap.add_argument("--no-extrapolate", action="store_true",
-                    help="do not append the 5 s post-failure poses after the last IMU row")
+    ap.add_argument("--extrapolate", action="store_true",
+                    help="append 5 s of dead-reckoned poses after the last IMU row (off by default: "
+                         "the Track 3 FAQ requires exactly one pose per input row)")
+    ap.add_argument("--no-extrapolate", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--gyro-deg", action="store_true", help="gyro columns are in deg/s")
     ap.add_argument("--no-smooth", action="store_true",
                     help="single-pass causal output (disables the offline two-pass smoother)")
     ap.add_argument("--profile-memory", action="store_true",
@@ -867,7 +1017,8 @@ def main(argv=None):
     if a.profile_memory:
         import tracemalloc
         tracemalloc.start()
-    info = run(a.input, a.output, prm, extrapolate=not a.no_extrapolate)
+    info = run(a.input, a.output, prm, extrapolate=a.extrapolate and not a.no_extrapolate,
+               gyro_deg=a.gyro_deg)
     if a.profile_memory:
         info["python_peak_heap_bytes"] = tracemalloc.get_traced_memory()[1]
         tracemalloc.stop()
