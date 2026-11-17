@@ -10,7 +10,7 @@ Python 3.8+ standard library only: no `pip install`, single file.
 python main.py evaluation_dataset.zip -o estimated_trajectory.txt --metadata metadata.json
 ```
 
-The input can be the zipped evaluation folder, the dataset folder (it searches for `imu0/data.csv`), or the CSV itself.
+The input can be the zipped evaluation folder, the dataset folder (it searches for `imu0/data.csv`), or the CSV itself. These call forms all work: `main.py IN -o OUT`, `main.py IN OUT`, `main.py --input IN --output OUT`, `main.py IN`, `main.py` with no arguments (finds `imu0/data.csv` below the current folder), and `main.estimate(IN, OUT)` from Python. Unknown flags are ignored with a warning.
 
 | Option | Meaning |
 |---|---|
@@ -113,4 +113,5 @@ Measured on Windows 11 with Python 3.11 on real EuRoC flights degraded with `deg
 | `make_official_runs.py` | Applies the organizers' `degrade_imu.py` to a real EuRoC flight in three input modes, writing ground truth and metadata for `evaluate.py`. |
 | `degrade_real.py` | My own degradation model applied to real EuRoC data (used before the official script was released). |
 | `eval_runs.py` | Scores a folder of runs against the stand-still and raw-strapdown baselines. |
-| `test_contract.py` | 24 output-contract checks (row count, formats, failure rows, dropouts). |
+| `test_contract.py` | 35 output-contract checks (row count, formats, failure rows, dropouts, call forms, fallback). |
+| `make_bundle.py` | Runs `main.py` on the evaluation dataset, verifies the contract against the input, and writes the submission zip. |

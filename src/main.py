@@ -44,6 +44,7 @@ import itertools
 import json
 import math
 import os
+import platform
 import struct
 import sys
 import tempfile
@@ -535,27 +536,54 @@ class PathFinder:
 # I/O
 # --------------------------------------------------------------------------
 def open_imu_csv(path):
-    """Return a text stream for imu0/data.csv given a csv, directory or zip."""
+    """Return a text stream for imu0/data.csv given a csv, directory or zip.
+    Read as utf-8-sig so a byte-order mark never turns the first row into a header."""
     if os.path.isdir(path):
-        cand = None
+        cand = other = None
         for root, _, files in os.walk(path):
             if os.path.basename(root) == "imu0" and "data.csv" in files:
                 cand = os.path.join(root, "data.csv")
                 break
             if cand is None and "data.csv" in files:
                 cand = os.path.join(root, "data.csv")
+            if other is None:
+                for f in sorted(files):
+                    if f.lower().endswith(".csv"):
+                        other = os.path.join(root, f)
+                        break
+        cand = cand or other
         if cand is None:
             raise FileNotFoundError("no imu0/data.csv under " + path)
-        return open(cand, "r", newline="")
+        return open(cand, "r", newline="", encoding="utf-8-sig", errors="replace")
     if zipfile.is_zipfile(path):
         zf = zipfile.ZipFile(path)
-        names = [n for n in zf.namelist() if n.endswith("imu0/data.csv")]
-        if not names:
-            names = [n for n in zf.namelist() if n.endswith(".csv")]
-        if not names:
+        allnames = zf.namelist()
+        norm = [n.replace("\\", "/") for n in allnames]          # zips made on Windows
+        idx = [i for i, n in enumerate(norm) if n.endswith("imu0/data.csv")]
+        if not idx:
+            idx = [i for i, n in enumerate(norm) if n.endswith("data.csv")]
+        if not idx:
+            idx = [i for i, n in enumerate(norm) if n.lower().endswith(".csv")]
+        if not idx:
             raise FileNotFoundError("no imu0/data.csv inside " + path)
-        return io.TextIOWrapper(zf.open(names[0]), encoding="utf-8", newline="")
-    return open(path, "r", newline="")
+        return io.TextIOWrapper(zf.open(allnames[idx[0]]), encoding="utf-8-sig", errors="replace",
+                                newline="")
+    return open(path, "r", newline="", encoding="utf-8-sig", errors="replace")
+
+
+def find_default_input(folder="."):
+    """Input to use when none is given: imu0/data.csv below the folder, else a
+    lone data.csv / .zip / .csv in it."""
+    for root, _, files in os.walk(folder):
+        if os.path.basename(root) == "imu0" and "data.csv" in files:
+            return os.path.join(root, "data.csv")
+    here = sorted(os.listdir(folder))
+    for pick in (lambda f: f == "data.csv", lambda f: f.lower().endswith(".zip"),
+                 lambda f: f.lower().endswith(".csv")):
+        hits = [f for f in here if pick(f)]
+        if len(hits) == 1:
+            return os.path.join(folder, hits[0])
+    return None
 
 
 G0 = 9.80665
@@ -1076,8 +1104,8 @@ def run(inp, out_path, prm, extrapolate=False, gyro_deg=False):
     elapsed = time.perf_counter() - t0
     span = (last_ts - t_first) * 1e-9 if last_ts is not None else 0.0
     return dict(
-        input=os.path.abspath(inp),
-        output=os.path.abspath(out_path),
+        input=os.path.basename(os.path.normpath(inp)),      # names only: this file is submitted
+        output=os.path.basename(out_path),
         imu_rows=n_out,
         extrapolated_rows=n_extra,
         nominal_rate_hz=round(1e9 / dt_nom_ns, 3),
@@ -1096,13 +1124,49 @@ def run(inp, out_path, prm, extrapolate=False, gyro_deg=False):
         runtime_s=round(elapsed, 4),
         runtime_ms_per_imu_second=round(1000.0 * elapsed / span, 3) if span > 0 else None,
         threads=1,
+        compute=dict(python=platform.python_version(), implementation=platform.python_implementation(),
+                     system=platform.system(), machine=platform.machine(), cpu_count=os.cpu_count()),
     )
 
 
+def estimate(input_path, output_path="estimated_trajectory.txt", **overrides):
+    """Importable entry point: degraded IMU file/folder/zip -> TUM trajectory file.
+    Returns the run statistics.  Falls back to the causal single pass if the
+    offline smoother fails for any reason, so a trajectory is always written."""
+    prm = dict(DEFAULTS)
+    prm.update(overrides)
+    return _run_safe(input_path, output_path, prm, False, False)
+
+
+def _run_safe(inp, out_path, prm, extrapolate, gyro_deg):
+    try:
+        return run(inp, out_path, prm, extrapolate=extrapolate, gyro_deg=gyro_deg)
+    except (FileNotFoundError, SystemExit):
+        raise
+    except Exception as ex:                       # never leave the evaluator without a file
+        if prm["smooth"] <= 0.0 and prm["rest_search"] <= 0.0:
+            raise
+        sys.stderr.write("[pathfinder] warning: %s: %s; retrying as a causal single pass\n"
+                         % (type(ex).__name__, ex))
+        safe = dict(prm, smooth=0.0, rest_search=0.0)
+        info = run(inp, out_path, safe, extrapolate=extrapolate, gyro_deg=gyro_deg)
+        info["fallback"] = "%s: %s" % (type(ex).__name__, ex)
+        return info
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Path Finder: degraded-IMU 6-DoF trajectory estimator")
-    ap.add_argument("input", help="imu0/data.csv, a EuRoC sequence directory or a .zip")
-    ap.add_argument("-o", "--output", default="estimated_trajectory.txt")
+    ap = argparse.ArgumentParser(
+        description="Path Finder: degraded-IMU 6-DoF trajectory estimator",
+        epilog="Accepted call forms: main.py IN | main.py IN OUT | main.py IN -o OUT | "
+               "main.py --input IN --output OUT | main.py (auto-finds imu0/data.csv below the "
+               "current folder).")
+    ap.add_argument("input", nargs="?", default=None,
+                    help="imu0/data.csv, a EuRoC sequence directory or a .zip")
+    ap.add_argument("output_pos", nargs="?", default=None, metavar="output",
+                    help="output trajectory (same as -o)")
+    ap.add_argument("-i", "--input", dest="input_opt", default=None, help="same as the positional input")
+    ap.add_argument("-o", "--output", default=None,
+                    help="output trajectory (default estimated_trajectory.txt)")
     ap.add_argument("--metadata", default=None, help="write run statistics as JSON")
     ap.add_argument("--extrapolate", action="store_true",
                     help="append 5 s of dead-reckoned poses after the last IMU row (off by default: "
@@ -1115,7 +1179,24 @@ def main(argv=None):
                     help="report Python peak heap usage (tracemalloc; slower)")
     ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VAL",
                     help="override a tuning parameter, e.g. --set tau_v=3")
-    a = ap.parse_args(argv)
+    a, unknown = ap.parse_known_args(argv)
+    if unknown:                                   # an evaluation harness may pass its own flags
+        sys.stderr.write("[pathfinder] warning: ignoring unrecognised arguments: %s\n" % " ".join(unknown))
+    inp = a.input_opt or a.input
+    if inp is None:
+        inp = find_default_input(".")
+        if inp is None:
+            ap.error("no input given and no imu0/data.csv found below the current folder")
+        sys.stderr.write("[pathfinder] no input given; using %s\n" % inp)
+    pos_out = a.output_pos
+    if pos_out and unknown and not (os.sep in pos_out or "/" in pos_out or "." in pos_out):
+        pos_out = None                            # e.g. the "1" of an unknown "--threads 1"
+    out_path = a.output or pos_out or "estimated_trajectory.txt"
+    if os.path.isdir(out_path):
+        out_path = os.path.join(out_path, "estimated_trajectory.txt")
+    parent = os.path.dirname(os.path.abspath(out_path))
+    if not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
     prm = dict(DEFAULTS)
     for kv in a.set:
         k, v = kv.split("=", 1)
@@ -1127,8 +1208,7 @@ def main(argv=None):
     if a.profile_memory:
         import tracemalloc
         tracemalloc.start()
-    info = run(a.input, a.output, prm, extrapolate=a.extrapolate and not a.no_extrapolate,
-               gyro_deg=a.gyro_deg)
+    info = _run_safe(inp, out_path, prm, a.extrapolate and not a.no_extrapolate, a.gyro_deg)
     if a.profile_memory:
         info["python_peak_heap_bytes"] = tracemalloc.get_traced_memory()[1]
         tracemalloc.stop()
@@ -1136,10 +1216,13 @@ def main(argv=None):
     sys.stderr.write(
         "[pathfinder] %d poses (+%d extrapolated) -> %s | %.1f ms per IMU-second | "
         "invalid=%d gaps=%d spikes=%d\n" % (
-            info["imu_rows"], info["extrapolated_rows"], a.output,
+            info["imu_rows"], info["extrapolated_rows"], out_path,
             info["runtime_ms_per_imu_second"] or 0.0,
             info["invalid_rows"], info["timestamp_gaps"], info["spikes_rejected"]))
     if a.metadata:
+        mparent = os.path.dirname(os.path.abspath(a.metadata))
+        if not os.path.isdir(mparent):
+            os.makedirs(mparent, exist_ok=True)
         with open(a.metadata, "w") as f:
             json.dump(info, f, indent=2)
     return 0

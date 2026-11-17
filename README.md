@@ -21,6 +21,19 @@ python src/main.py path/to/evaluation_dataset.zip -o estimated_trajectory.txt --
 
 The input can be the `.zip`, the unzipped folder, or `imu0/data.csv` itself. No `pip install` is needed.
 
+The evaluation harness's exact command isn't published, so every plausible call form works:
+
+| Call | Behaviour |
+|---|---|
+| `main.py IN -o OUT` | the documented form |
+| `main.py IN OUT` | positional output |
+| `main.py --input IN --output OUT` | flag form |
+| `main.py IN` | writes `estimated_trajectory.txt` in the current folder |
+| `main.py` (no arguments) | finds `imu0/data.csv` below the current folder |
+| `import main; main.estimate(IN, OUT)` | importable API |
+
+Unknown flags are ignored with a warning, a missing output folder is created, and an output path that is a folder gets `estimated_trajectory.txt` inside it. If the offline smoother ever fails, the script falls back to its causal single pass, so a complete trajectory is always written.
+
 Docker:
 
 ```bash
@@ -31,7 +44,13 @@ docker build -t pathfinder .
 docker run --rm -v "$PWD/data:/data" pathfinder /data/evaluation_dataset.zip -o /data/estimated_trajectory.txt --metadata /data/metadata.json
 ```
 
-Then zip the bundle as `team_name.zip`, using your registered `CollegeName_TeamName`.
+**Building the submission bundle** in one step, once the evaluation dataset is released:
+
+```bash
+python tools/make_bundle.py path/to/evaluation_dataset.zip CollegeName_TeamName
+```
+
+It runs `main.py`, verifies the output against the input (one pose per IMU row, timestamps in input order, 8 finite columns, unit quaternions), and writes `CollegeName_TeamName.zip` in the layout above. `metadata.json` records file names only, never local paths.
 
 ## Compliance with the official Track 3 package
 
@@ -132,7 +151,7 @@ Key findings along the way:
 
 ## Verification
 
-Contract tests cover: one pose per row, no appended poses, all-zero and NaN blind rows, accel-first and headerless input, s/ms timestamps, accelerometer in g, duplicated, stuck and garbage rows, dropouts, zip and CRLF.
+35 contract tests cover: one pose per row, no appended poses, all-zero and NaN blind rows, accel-first and headerless input, s/ms timestamps, accelerometer in g, duplicated, stuck and garbage rows, dropouts, zip (including Windows-style paths), CRLF and a UTF-8 BOM, every call form in the table above, and the smoother-failure fallback.
 
 ```bash
 python tools/test_contract.py

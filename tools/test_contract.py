@@ -76,6 +76,72 @@ def pos(e):
     return [tuple(float(x) for x in r[1:8]) for r in e]
 
 
+def cli_tests(base, n, e_ref):
+    """Every way an evaluation harness might plausibly invoke the script."""
+    ok = True
+    d = tempfile.mkdtemp()
+    csv = os.path.join(d, "mav0", "imu0", "data.csv")
+    os.makedirs(os.path.dirname(csv))
+    with open(csv, "w", newline="") as f:
+        f.write("\n".join([HDR] + base) + "\n")
+
+    def read(path):
+        return [l.split() for l in open(path) if not l.startswith("#")]
+
+    def call(args, cwd=None):
+        return subprocess.run(CMD + args, capture_output=True, text=True, cwd=cwd)
+
+    out = os.path.join(d, "a.txt")
+    r = call([csv, out])
+    ok &= check("call form: main.py IN OUT", r.returncode == 0 and read(out) == e_ref)
+    out = os.path.join(d, "b.txt")
+    r = call(["--input", csv, "--output", out])
+    ok &= check("call form: main.py --input IN --output OUT", r.returncode == 0 and read(out) == e_ref)
+    r = call([], cwd=d)
+    ok &= check("call form: no arguments, run from the dataset folder",
+                r.returncode == 0 and read(os.path.join(d, "estimated_trajectory.txt")) == e_ref)
+    out = os.path.join(d, "c.txt")
+    r = call([csv, "-o", out, "--threads", "1", "--verbose"])
+    ok &= check("unknown harness flags are ignored, not fatal", r.returncode == 0 and read(out) == e_ref)
+    out = os.path.join(d, "new", "sub", "est.txt")
+    r = call([csv, "-o", out])
+    ok &= check("output folder is created if missing", r.returncode == 0 and read(out) == e_ref)
+    odir = os.path.join(d, "outdir")
+    os.makedirs(odir)
+    r = call([csv, "-o", odir])
+    ok &= check("output given as a folder -> estimated_trajectory.txt inside",
+                r.returncode == 0 and read(os.path.join(odir, "estimated_trajectory.txt")) == e_ref)
+    bom = os.path.join(d, "bom.csv")
+    with open(bom, "w", newline="", encoding="utf-8-sig") as f:      # BOM + no header
+        f.write("\n".join(base) + "\n")
+    out = os.path.join(d, "d.txt")
+    r = call([bom, out])
+    ok &= check("UTF-8 BOM without header: first row is not lost", r.returncode == 0 and len(read(out)) == n)
+    z = os.path.join(d, "win.zip")
+    with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:        # Windows-style separators
+        zf.writestr("eval\\mav0\\imu0\\data.csv", "\n".join([HDR] + base) + "\n")
+    out = os.path.join(d, "e.txt")
+    r = call([z, out])
+    ok &= check("zip with backslash paths", r.returncode == 0 and read(out) == e_ref)
+    out = os.path.join(d, "f.txt")
+    code = ("import sys; sys.path.insert(0, %r); import main; "
+            "info = main.estimate(%r, %r); print(info['imu_rows'])" % (os.path.dirname(MAIN), csv, out))
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    ok &= check("importable API: main.estimate(input, output)",
+                r.returncode == 0 and r.stdout.strip() == str(n) and read(out) == e_ref)
+    out = os.path.join(d, "g.txt")
+    code = ("import sys; sys.path.insert(0, %r); import main\n"
+            "def boom(*a, **k): raise RuntimeError('injected smoother failure')\n"
+            "main._smooth = boom\n"
+            "info = main.estimate(%r, %r); print(info.get('fallback', ''))" % (os.path.dirname(MAIN), csv, out))
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    ok &= check("smoother failure falls back to a full causal trajectory",
+                r.returncode == 0 and "injected" in r.stdout and len(read(out)) == n)
+    r = call([os.path.join(d, "does_not_exist.csv")])
+    ok &= check("missing input fails with a non-zero exit code", r.returncode != 0)
+    return ok
+
+
 def main():
     ok = True
     n = 2000
@@ -149,6 +215,7 @@ def main():
     ok &= check("out-of-order row keeps a pose", len(e) == n)
     e = run(base, "--no-smooth")
     ok &= check("--no-smooth (causal) also one pose per row", len(e) == n)
+    ok &= cli_tests(base, n, e_ref)
     print("ALL PASS" if ok else "SOME TESTS FAILED")
     return 0 if ok else 1
 
