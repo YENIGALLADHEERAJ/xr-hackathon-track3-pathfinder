@@ -37,19 +37,15 @@ Output frame: z-up, gravity aligned, origin = start position, yaw = 0 at start.
 alignment `-a` maps between them.)
 """
 
-import argparse
-import decimal
 import io
-import itertools
-import json
 import math
 import os
-import platform
 import struct
 import sys
-import tempfile
 import time
-import zipfile
+
+# zipfile, decimal, json, platform and tempfile are imported only where they are
+# needed: together with argparse they would add ~3 MB to the heap at start-up.
 
 # --------------------------------------------------------------------------
 # Tunable parameters. Selected on real EuRoC V1_01 degraded with the organizers'
@@ -75,6 +71,10 @@ DEFAULTS = dict(
                          # slow flight look static and corrupted the gyro bias
     horizon_s=5.0,       # post-failure dead-reckoning horizon [s]
     shrink_gamma=0.0,    # position shrinkage exponent vs. noise growth (0 = off)
+    out_gain=1.2,        # output position gain: the leaky integrators shrink slow motion
+                         # (best ATE/RPE across all four validation sequences, see README)
+    interp_max=0.5,      # gaps / invalid runs up to this long [s] are filled by interpolating
+                         # between the samples on either side (offline); longer ones dead-reckon
     # --- rotor-drag velocity aiding (multirotors), gated by a multirotor detector ---
     drag=1.0,            # 1 = enabled (detector keeps it off on non-multirotor data)
     drag_gain=-2.45,     # velocity per unit lateral specific force [s] = -1/k (EuRoC Firefly)
@@ -205,6 +205,12 @@ class PathFinder:
         self.n_gaps = 0
         self.blind_time = 0.0
         self.sink = None                   # step recorder for the offline smoother
+        self.last_good = None              # last accepted measurement (for gap interpolation)
+        self.last_good_ts = None
+        self.pending = []                  # invalid rows waiting for the next valid sample
+        self.long_gap = False
+        self.p_last_raw = None             # stale tracking for the pending buffer
+        self.p_stale = 0
 
     # ---------------- initial alignment ----------------
     def initialise(self, samples, dt_nom):
@@ -246,34 +252,134 @@ class PathFinder:
         self.eref = ab.index(min(ab))
 
     # ---------------- per-sample update ----------------
-    def update(self, ts, m):
-        """ts: int nanoseconds; m: 6-tuple (wx,wy,wz,ax,ay,az) or None."""
+    def update(self, ts, m, synthetic=False):
+        """ts: int nanoseconds; m: 6-tuple (wx,wy,wz,ax,ay,az) or None.
+        synthetic=True: m is already gated / interpolated (skip the front-end)."""
         if self.t_prev is None:
             self.t_prev = ts
             if m is not None:
                 self.ref = list(m)
+                if not synthetic:
+                    self.last_good, self.last_good_ts = list(m), ts
             return
         dt = (ts - self.t_prev) * 1e-9
         if dt <= 0.0:                       # duplicate / out of order: hold pose
             return
+        t_old = self.t_prev
         self.t_prev = ts
         dtn = self.dt_nom
         if dt > self.p["gap_factor"] * dtn:  # timestamp gap -> dropped frames
             self.n_gaps += 1
             gap = dt - dtn
             k = min(int(gap / dtn + 0.5), 20000)
+            lg = self.last_good
+            if (self.p["interp_max"] > 0.0 and m is not None and lg is not None and k > 0
+                    and (ts - self.last_good_ts) * 1e-9 <= self.p["interp_max"]):
+                mg = m if synthetic else self._gate(m, dtn)
+                if mg is not None:          # fill the gap by interpolating the measurements
+                    span = float(ts - self.last_good_ts)
+                    sub = gap / k
+                    for j in range(1, k + 1):
+                        f = (t_old + j * sub * 1e9 - self.last_good_ts) / span
+                        mj = [lg[i] + f * (mg[i] - lg[i]) for i in range(6)]
+                        self.tb = 0.0
+                        self._propagate(sub, mj)
+                    self.tb = 0.0
+                    self._propagate(dtn, mg)
+                    if not synthetic:
+                        self.last_good, self.last_good_ts = list(mg), ts
+                    return
+                for _ in range(k):          # gated out: dead-reckon the gap and this row
+                    self._blind(sub)
+                self.n_invalid += 1
+                self._blind(dtn)
+                return
             if k > 0:
                 sub = gap / k
                 for _ in range(k):
                     self._blind(sub)
             dt = dtn
-        m = self._gate(m, dt)
+        if not synthetic:
+            m = self._gate(m, dt)
         if m is None:
             self.n_invalid += 1
             self._blind(dt)
         else:
             self.tb = 0.0
             self._propagate(dt, m)
+            if not synthetic:
+                self.last_good, self.last_good_ts = list(m), ts
+
+    # ---------------- offline gap filling for invalid rows ----------------
+    def _prevalid(self, m):
+        """Cheap copy of the front-end's rejection rules (no state shared with it)."""
+        if m is None or (m[3] == 0.0 and m[4] == 0.0 and m[5] == 0.0):
+            return False
+        for i in range(3):
+            if abs(m[i]) > GYRO_MAX or abs(m[3 + i]) > ACC_MAX:
+                return False
+        if m == self.p_last_raw:
+            self.p_stale += 1
+        else:
+            self.p_stale = 0
+            self.p_last_raw = m
+        return self.p_stale < 3
+
+    def push(self, ts, m, emit):
+        """Process one input row and call emit(ts) for every row whose pose is
+        final, in input order.  With interp_max > 0, invalid rows (NaN, zero,
+        stuck) are held until the next valid sample and then filled by
+        interpolation; runs longer than interp_max (e.g. the 5 s failure) are
+        dead-reckoned as before."""
+        imax = self.p["interp_max"]
+        if imax <= 0.0:
+            self.update(ts, m)
+            emit(ts)
+            return
+        valid = self._prevalid(m)
+        if not valid:
+            if self.last_good is None or self.long_gap:
+                self.update(ts, None)
+                emit(ts)
+                return
+            self.pending.append(ts)
+            if (ts - self.last_good_ts) * 1e-9 > imax:      # too long: dead-reckon
+                for tp in self.pending:
+                    self.update(tp, None)
+                    emit(tp)
+                self.pending = []
+                self.long_gap = True
+            return
+        self.long_gap = False
+        if self.pending:
+            mg = self._gate(m, self.dt_nom)
+            lg, t0 = self.last_good, self.last_good_ts
+            if mg is None or lg is None or ts <= t0:
+                for tp in self.pending:
+                    self.update(tp, None)
+                    emit(tp)
+            else:
+                span = float(ts - t0)
+                for tp in self.pending:
+                    f = (tp - t0) / span
+                    self.update(tp, [lg[i] + f * (mg[i] - lg[i]) for i in range(6)], synthetic=True)
+                    emit(tp)
+            self.pending = []
+            if mg is not None:
+                self.update(ts, mg, synthetic=True)
+                self.last_good, self.last_good_ts = list(mg), ts
+            else:
+                self.update(ts, None)
+            emit(ts)
+            return
+        self.update(ts, m)
+        emit(ts)
+
+    def flush_pending(self, emit):
+        for tp in self.pending:
+            self.update(tp, None)
+            emit(tp)
+        self.pending = []
 
     # ---------------- front-end ----------------
     def _gate(self, m, dt):
@@ -528,7 +634,7 @@ class PathFinder:
             b = min(1.0, (self.na_min / self.na) ** (0.5 * gam))
             self.beta += 0.01 * (b - self.beta)
         pos = self.pos
-        bt = self.beta
+        bt = self.beta * self.p["out_gain"]
         return (pos[0] * bt, pos[1] * bt, pos[2] * bt), (x, y, z, w)
 
 
@@ -555,7 +661,8 @@ def open_imu_csv(path):
         if cand is None:
             raise FileNotFoundError("no imu0/data.csv under " + path)
         return open(cand, "r", newline="", encoding="utf-8-sig", errors="replace")
-    if zipfile.is_zipfile(path):
+    if _is_zip(path):
+        import zipfile
         zf = zipfile.ZipFile(path)
         allnames = zf.namelist()
         norm = [n.replace("\\", "/") for n in allnames]          # zips made on Windows
@@ -569,6 +676,14 @@ def open_imu_csv(path):
         return io.TextIOWrapper(zf.open(allnames[idx[0]]), encoding="utf-8-sig", errors="replace",
                                 newline="")
     return open(path, "r", newline="", encoding="utf-8-sig", errors="replace")
+
+
+def _is_zip(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) in (b"PK\x03\x04", b"PK\x05\x06")
+    except OSError:
+        return False
 
 
 def find_default_input(folder="."):
@@ -697,6 +812,7 @@ class InputFormat:
         tok = tok.strip()
         if self.ts_exp == 0 and tok.isdigit():
             return int(tok)
+        import decimal
         d = decimal.Decimal(tok).scaleb(self.ts_exp)
         return int(d.to_integral_value(rounding=decimal.ROUND_HALF_EVEN))
 
@@ -704,7 +820,7 @@ class InputFormat:
         """-> (ts_ns, meas|None) with meas = (wx, wy, wz, ax, ay, az) in rad/s, m/s^2."""
         try:
             ts = self.ts_ns(parts[0])
-        except (ValueError, decimal.InvalidOperation):
+        except (ValueError, ArithmeticError):        # decimal.InvalidOperation is one
             return None
         meas = None
         if len(parts) >= 7:
@@ -724,6 +840,42 @@ class InputFormat:
                 k = self.acc_scale
                 meas = meas[0:3] + (meas[3] * k, meas[4] * k, meas[5] * k)
         return ts, meas
+
+
+class _TempDir:
+    """Private temp folder (system temp, else next to the output); removed by cleanup()."""
+
+    def __init__(self, near):
+        bases = [os.environ.get(k) for k in ("TMPDIR", "TEMP", "TMP")]
+        bases += ["/tmp", os.path.dirname(os.path.abspath(near))]
+        for b in bases:
+            if not b or not os.path.isdir(b):
+                continue
+            name = os.path.join(b, "pathfinder_%d_%d" % (os.getpid(), time.time_ns()))
+            try:
+                os.mkdir(name)
+            except OSError:
+                continue
+            self.name = name
+            return
+        raise OSError("no writable temporary folder")
+
+    def cleanup(self):
+        name, self.name = getattr(self, "name", None), None
+        if not name:
+            return
+        for f in os.listdir(name):
+            try:
+                os.remove(os.path.join(name, f))
+            except OSError:
+                pass
+        try:
+            os.rmdir(name)
+        except OSError:
+            pass
+
+    def __del__(self):
+        self.cleanup()
 
 
 def find_rest(inp, gyro_deg, dt_nom_ns, prm, n=200, step=50):
@@ -911,6 +1063,7 @@ def _smooth(t1_path, tmpdir, out, prm, k_last):
     after it (the post-failure blind tail) the forward dead reckoning is kept,
     anchored to the smoothed position at failure."""
     tps = prm["tau_ps"]
+    gain = prm["out_gain"]
     t2_path = os.path.join(tmpdir, "vf.bin")
     t3_path = os.path.join(tmpdir, "vb.bin")
     with open(t1_path, "rb") as f1:
@@ -977,7 +1130,7 @@ def _smooth(t1_path, tmpdir, out, prm, k_last):
                     py = ps_fail[1] + r[10] - pos_ref[1]
                     pz = ps_fail[2] + r[11] - pos_ref[2]
                 lines.append("%s %.6f %.6f %.6f %.9f %.9f %.9f %.9f\n" % (
-                    fmt_ts(r[3]), px * beta, py * beta, pz * beta, r[4], r[5], r[6], r[7]))
+                    fmt_ts(r[3]), px * beta * gain, py * beta * gain, pz * beta * gain, r[4], r[5], r[6], r[7]))
                 if len(lines) >= LINE_BUF:
                     out.write("".join(lines))
                     lines.clear()
@@ -1026,7 +1179,7 @@ def run(inp, out_path, prm, extrapolate=False, gyro_deg=False):
     tmpdir = t1 = None
     if smooth:
         try:
-            tmpdir = tempfile.TemporaryDirectory(prefix="pathfinder_")
+            tmpdir = _TempDir(out_path)
             t1 = open(os.path.join(tmpdir.name, "steps.bin"), "wb")
         except OSError as ex:          # no usable temp space: causal single pass
             sys.stderr.write("[pathfinder] warning: %s; using causal (single-pass) mode\n" % ex)
@@ -1061,11 +1214,16 @@ def run(inp, out_path, prm, extrapolate=False, gyro_deg=False):
             out.write("".join(buf))
         buf.clear()
 
-    def consume(ts, m):
-        nonlocal n_out, last_ts, trailing_invalid_ns, run_start
-        est.update(ts, m)
+    def emit_row(ts):
+        nonlocal n_out
         emit(ts)
         n_out += 1
+        if len(buf) >= LINE_BUF:
+            flush()
+
+    def consume(ts, m):
+        nonlocal last_ts, trailing_invalid_ns, run_start
+        est.push(ts, m, emit_row)
         if m is None or (m[3] == 0.0 and m[4] == 0.0 and m[5] == 0.0):   # invalid (NaN / zero rows)
             if run_start is None:
                 run_start = last_ts if last_ts is not None else ts
@@ -1074,14 +1232,13 @@ def run(inp, out_path, prm, extrapolate=False, gyro_deg=False):
             run_start = None
             trailing_invalid_ns = 0
         last_ts = ts
-        if len(buf) >= LINE_BUF:
-            flush()
 
     for ts, m in head:
         consume(ts, m)
     head = None
     for ts, m in rows:
         consume(ts, m)
+    est.flush_pending(emit_row)
 
     # ---- post-failure dead reckoning beyond the last frame ----
     n_extra = 0
@@ -1124,8 +1281,6 @@ def run(inp, out_path, prm, extrapolate=False, gyro_deg=False):
         runtime_s=round(elapsed, 4),
         runtime_ms_per_imu_second=round(1000.0 * elapsed / span, 3) if span > 0 else None,
         threads=1,
-        compute=dict(python=platform.python_version(), implementation=platform.python_implementation(),
-                     system=platform.system(), machine=platform.machine(), cpu_count=os.cpu_count()),
     )
 
 
@@ -1154,62 +1309,106 @@ def _run_safe(inp, out_path, prm, extrapolate, gyro_deg):
         return info
 
 
+USAGE = """usage: main.py [IN] [OUT] [-i IN] [-o OUT] [--metadata FILE] [--gyro-deg] [--no-smooth]
+               [--extrapolate] [--profile-memory] [--set KEY=VAL ...]
+
+Path Finder: degraded-IMU 6-DoF trajectory estimator (XR Hackathon 2026, Track 03).
+IN is imu0/data.csv, a EuRoC-style sequence folder or a .zip; OUT defaults to
+estimated_trajectory.txt.  With no IN, imu0/data.csv is searched below the
+current folder.  Unknown options are ignored with a warning.
+
+  -i, --input IN       input (same as the positional IN)
+  -o, --output OUT     output trajectory (same as the positional OUT)
+  --metadata FILE      write run statistics as JSON
+  --gyro-deg           gyro columns are in deg/s
+  --no-smooth          single-pass causal output (no offline smoother)
+  --extrapolate        append 5 s of poses after the last row (off: the FAQ
+                       requires exactly one pose per input row)
+  --profile-memory     report the Python heap peak (tracemalloc; slower)
+  --set KEY=VAL ...    override tuning parameters (see DEFAULTS)
+"""
+
+_FLAGS = {"--extrapolate", "--no-extrapolate", "--gyro-deg", "--no-smooth", "--profile-memory"}
+_VALUED = {"-i": "input", "--input": "input", "-o": "output", "--output": "output",
+           "--metadata": "metadata"}
+
+
+def parse_args(argv):
+    """Returns (options dict, positionals, unknown).  Accepts '--opt value' and
+    '--opt=value'; an unknown '--opt value' pair is skipped as a whole when the
+    value does not look like a path."""
+    opt = {"set": []}
+    pos, unknown = [], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            sys.stdout.write(USAGE)
+            raise SystemExit(0)
+        key, val = (a.split("=", 1) + [None])[:2] if a.startswith("--") and "=" in a else (a, None)
+        if key in _VALUED:
+            if val is None:
+                i += 1
+                if i >= len(argv):
+                    raise SystemExit("option %s needs a value" % key)
+                val = argv[i]
+            opt[_VALUED[key]] = val
+        elif key in _FLAGS:
+            opt[key[2:].replace("-", "_")] = True
+        elif key == "--set":
+            while i + 1 < len(argv) and "=" in argv[i + 1] and not argv[i + 1].startswith("-"):
+                i += 1
+                opt["set"].append(argv[i])
+        elif a.startswith("-") and len(a) > 1:
+            unknown.append(a)
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            if val is None and nxt is not None and not nxt.startswith("-") and \
+                    not any(c in nxt for c in "/\\.") and len(pos) >= 1:
+                unknown.append(nxt)            # its value, e.g. "--threads 1"
+                i += 1
+        else:
+            pos.append(a)
+        i += 1
+    return opt, pos, unknown
+
+
+def _compute_info():
+    import platform
+    return dict(python=platform.python_version(), implementation=platform.python_implementation(),
+                system=platform.system(), machine=platform.machine(), cpu_count=os.cpu_count())
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(
-        description="Path Finder: degraded-IMU 6-DoF trajectory estimator",
-        epilog="Accepted call forms: main.py IN | main.py IN OUT | main.py IN -o OUT | "
-               "main.py --input IN --output OUT | main.py (auto-finds imu0/data.csv below the "
-               "current folder).")
-    ap.add_argument("input", nargs="?", default=None,
-                    help="imu0/data.csv, a EuRoC sequence directory or a .zip")
-    ap.add_argument("output_pos", nargs="?", default=None, metavar="output",
-                    help="output trajectory (same as -o)")
-    ap.add_argument("-i", "--input", dest="input_opt", default=None, help="same as the positional input")
-    ap.add_argument("-o", "--output", default=None,
-                    help="output trajectory (default estimated_trajectory.txt)")
-    ap.add_argument("--metadata", default=None, help="write run statistics as JSON")
-    ap.add_argument("--extrapolate", action="store_true",
-                    help="append 5 s of dead-reckoned poses after the last IMU row (off by default: "
-                         "the Track 3 FAQ requires exactly one pose per input row)")
-    ap.add_argument("--no-extrapolate", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--gyro-deg", action="store_true", help="gyro columns are in deg/s")
-    ap.add_argument("--no-smooth", action="store_true",
-                    help="single-pass causal output (disables the offline two-pass smoother)")
-    ap.add_argument("--profile-memory", action="store_true",
-                    help="report Python peak heap usage (tracemalloc; slower)")
-    ap.add_argument("--set", nargs="*", default=[], metavar="KEY=VAL",
-                    help="override a tuning parameter, e.g. --set tau_v=3")
-    a, unknown = ap.parse_known_args(argv)
+    opt, pos, unknown = parse_args(sys.argv[1:] if argv is None else list(argv))
     if unknown:                                   # an evaluation harness may pass its own flags
         sys.stderr.write("[pathfinder] warning: ignoring unrecognised arguments: %s\n" % " ".join(unknown))
-    inp = a.input_opt or a.input
+    inp = opt.get("input") or (pos[0] if pos else None)
     if inp is None:
         inp = find_default_input(".")
         if inp is None:
-            ap.error("no input given and no imu0/data.csv found below the current folder")
+            sys.stderr.write(USAGE)
+            raise SystemExit("error: no input given and no imu0/data.csv found below the current folder")
         sys.stderr.write("[pathfinder] no input given; using %s\n" % inp)
-    pos_out = a.output_pos
-    if pos_out and unknown and not (os.sep in pos_out or "/" in pos_out or "." in pos_out):
-        pos_out = None                            # e.g. the "1" of an unknown "--threads 1"
-    out_path = a.output or pos_out or "estimated_trajectory.txt"
+    out_path = opt.get("output") or (pos[1] if len(pos) > 1 else None) or "estimated_trajectory.txt"
     if os.path.isdir(out_path):
         out_path = os.path.join(out_path, "estimated_trajectory.txt")
     parent = os.path.dirname(os.path.abspath(out_path))
     if not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
     prm = dict(DEFAULTS)
-    for kv in a.set:
+    for kv in opt["set"]:
         k, v = kv.split("=", 1)
         if k not in prm:
             raise SystemExit("unknown parameter " + k)
         prm[k] = float(v)
-    if a.no_smooth:
+    if opt.get("no_smooth"):
         prm["smooth"] = 0.0
-    if a.profile_memory:
+    if opt.get("profile_memory"):
         import tracemalloc
         tracemalloc.start()
-    info = _run_safe(inp, out_path, prm, a.extrapolate and not a.no_extrapolate, a.gyro_deg)
-    if a.profile_memory:
+    info = _run_safe(inp, out_path, prm, bool(opt.get("extrapolate")) and not opt.get("no_extrapolate"),
+                     bool(opt.get("gyro_deg")))
+    if opt.get("profile_memory"):
         info["python_peak_heap_bytes"] = tracemalloc.get_traced_memory()[1]
         tracemalloc.stop()
     info["parameters"] = prm
@@ -1219,11 +1418,13 @@ def main(argv=None):
             info["imu_rows"], info["extrapolated_rows"], out_path,
             info["runtime_ms_per_imu_second"] or 0.0,
             info["invalid_rows"], info["timestamp_gaps"], info["spikes_rejected"]))
-    if a.metadata:
-        mparent = os.path.dirname(os.path.abspath(a.metadata))
+    if opt.get("metadata"):
+        import json
+        info["compute"] = _compute_info()
+        mparent = os.path.dirname(os.path.abspath(opt["metadata"]))
         if not os.path.isdir(mparent):
             os.makedirs(mparent, exist_ok=True)
-        with open(a.metadata, "w") as f:
+        with open(opt["metadata"], "w") as f:
             json.dump(info, f, indent=2)
     return 0
 

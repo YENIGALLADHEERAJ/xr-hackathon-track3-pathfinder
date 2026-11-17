@@ -82,11 +82,12 @@ The design is a streaming complementary filter. It reads one row, updates the st
 
      The spread test alone was fooled on TUM-VI (a phone held roughly level), where drag made ATE 74% *worse* than standing still; with the vibration gate it's 17.5% better. Gate closed means exactly the plain filter.
    - Self-calibrating the gain online was tried and rejected: the integrated velocity it would calibrate against tracks true velocity worse than drag itself does.
-7. **Dead reckoning (dropouts and post-failure).** With no valid measurement, the state is extrapolated from the last smoothed velocity and body rate, each decaying exponentially (`τ_vb`=0.25 s, `τ_wb`=0.1 s). The short velocity memory was the best average over four sequences: the velocity estimate at failure is at its noisiest. This is the same code path for a single dropped frame, the 2-second signal loss and the final 5-second blind segment. When data comes back, integration resumes from the dead-reckoned state with no reset jump.
+7. **Gap filling, then dead reckoning.** Gaps of up to 0.5 s (`interp_max`) are filled offline: missing rows by interpolating between the samples on either side of the timestamp jump, and invalid rows inside the data (stuck, NaN, zero) are held back until the next valid sample and then interpolated. This keeps rotation through short dropouts: rotation error fell from 0.71 to 0.27 °/s on V1_02 and from 1.80 to 0.82 °/s on TUM-VI. For anything longer, the state is dead-reckoned: with no valid measurement it is extrapolated from the last smoothed velocity and body rate, each decaying exponentially (`τ_vb`=0.25 s, `τ_wb`=0.1 s). The short velocity memory was the best average over four sequences: the velocity estimate at failure is at its noisiest. This is the same code path for a single dropped frame, the 2-second signal loss and the final 5-second blind segment. When data comes back, integration resumes from the dead-reckoned state with no reset jump.
 8. **Offline two-pass smoothing (default).** The track is offline, so each estimate can use future samples as well as past ones.
    - The forward pass above streams one fixed-size record per filter step: dt, gravity-free world acceleration, drag target velocity, and static and drag flags. It also writes one per output row: timestamp, attitude, shrink factor and forward position. All of this goes to a temp file.
    - Pass B1 integrates velocity forward. Pass B2 reads the file **backwards**, integrating velocity backward in time, averaging it with the forward velocity, and integrating position backward. Pass C integrates position forward, averages it with the backward position, and writes the poses.
    - The result is a zero-phase version of the same leaky filter (`tau_vs`=0.75 s, `tau_ps`=15 s), without the lag the causal leaks put on real motion.
+   - The leaks still attenuate slow motion, and SE(3) alignment cannot rescale, so positions are output with a gain of 1.2 (`out_gain`). It is the conservative choice across the four validation sequences: larger gains help the large hall but hurt the small room.
    - Attitude is unchanged; it's already at the gyro's limit. After the last real measurement (the post-failure blind segment), the forward dead reckoning is kept, anchored to the smoothed position at failure.
    - Memory stays O(1). The temp file holds about 110 bytes per IMU sample and is read in 1,024-record chunks. If no temp directory is writable, the run falls back to the causal pass with a warning.
 
@@ -96,8 +97,8 @@ Measured on Windows 11 with Python 3.11 on real EuRoC flights degraded with `deg
 
 | Budget | Limit | Measured |
 |---|---|---|
-| Peak RAM (heap: data structures, buffers, estimation) | ≤ 8 MB | **0.45–0.52 MB**, constant in sequence length (streaming; I/O in 256–512-record batches) |
-| Compute per 1 s of IMU | ≤ 20 ms | **2.3–2.7 ms** (the upper figure when the rest-window pre-pass runs) |
+| Peak RAM (heap: data structures, buffers, estimation) | ≤ 8 MB | **0.44–0.51 MB**, constant in sequence length (streaming; I/O in 256–512-record batches). Python compiling the script itself transiently needs about 4.6 MB more, before any estimation starts. |
+| Compute per 1 s of IMU | ≤ 20 ms | **2.8–3.3 ms** |
 | Threads | 1 | 1 |
 
 ## Validation tools (`tools/`)

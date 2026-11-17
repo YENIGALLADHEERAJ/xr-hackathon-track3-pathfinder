@@ -62,8 +62,8 @@ It runs `main.py`, verifies the output against the input (one pose per IMU row, 
 | Dropouts are missing rows | Timestamp gaps are bridged by dead reckoning; every remaining row gets its pose |
 | Estimate from the IMU file only | No other input is read |
 | Offline; future samples may be used | Two-pass zero-phase smoother (see `src/README.md`) |
-| ≤ 8 MB peak RAM, **measured at heap level** | **0.45–0.52 MB** heap peak (tracemalloc), constant in sequence length |
-| ≤ 20 ms compute per 1 s of IMU, one thread | **2.3–2.7 ms** per IMU-second, single thread (the upper figure includes the rest-window pre-pass) |
+| ≤ 8 MB peak RAM, **measured at heap level** | **0.44–0.51 MB** heap peak while estimating (tracemalloc), constant in sequence length. Counted from interpreter start it is 4.6 MB, almost all of it Python compiling the 60 KB script itself; heavy standard-library modules are imported only when needed. |
+| ≤ 20 ms compute per 1 s of IMU, one thread | **2.8–3.3 ms** per IMU-second, single thread |
 | SE(3)-aligned ATE and RPE (evo) | Output frame: z-up, gravity aligned, starting at the origin |
 
 ### Input formats handled
@@ -101,20 +101,20 @@ Four real sequences covering both datasets the jury uses: two Vicon-room flights
 
 | Sequence | Mode | Stand-still ATE | **Path Finder ATE** | Checkpoint err | Blind 5 s drift | Dropout-window err | Rotation RPE |
 |---|---|---|---|---|---|---|---|
-| V1_01 | euroc | 1.857 | **1.522 (−18.0%)** | 1.406 | 0.296 | 1.248 | 0.64 °/s |
-| | accelfirst | 1.857 | **1.519 (−18.2%)** | 1.405 | 0.297 | 1.313 | 0.63 °/s |
-| | direct | 1.857 | **1.463 (−21.2%)** | 1.397 | 0.330 | 1.717 | 2.12 °/s |
-| V1_02 | euroc | 1.816 | **1.473 (−18.9%)** | 1.148 | 0.680 | 1.588 | 0.75 °/s |
-| | accelfirst | 1.816 | **1.458 (−19.7%)** | 1.155 | 0.692 | 1.322 | 0.69 °/s |
-| | direct | 1.816 | **1.440 (−20.7%)** | 1.128 | 0.702 | 1.277 | 0.69 °/s |
-| MH_04 | euroc | 6.942 | **5.609 (−19.2%)** | 4.981 | 0.427 | 6.752 | 0.23 °/s |
-| | accelfirst | 6.942 | **5.572 (−19.7%)** | 4.894 | 0.422 | 6.540 | 0.23 °/s |
-| | direct | 6.942 | **5.641 (−18.7%)** | 4.922 | 0.774 | 6.401 | 1.45 °/s |
-| TUM-VI room1 | euroc | 1.013 | **0.836 (−17.5%)** | 0.763 | 0.832 | 0.771 | 1.78 °/s |
-| | accelfirst | 1.013 | **0.831 (−18.0%)** | 0.760 | 0.841 | 0.781 | 1.78 °/s |
-| | direct | 1.013 | **0.835 (−17.6%)** | 0.770 | 0.860 | 0.800 | 1.84 °/s |
+| V1_01 | euroc | 1.857 | **1.524 (−17.9%)** | 1.383 | 0.311 | 1.115 | 0.51 °/s |
+| | accelfirst | 1.857 | **1.522 (−18.0%)** | 1.386 | 0.309 | 1.071 | 0.51 °/s |
+| | direct | 1.857 | **1.462 (−21.3%)** | 1.380 | 0.398 | 1.820 | 2.07 °/s |
+| V1_02 | euroc | 1.816 | **1.484 (−18.3%)** | 1.134 | 0.671 | 1.704 | 0.28 °/s |
+| | accelfirst | 1.816 | **1.465 (−19.3%)** | 1.143 | 0.680 | 1.403 | 0.28 °/s |
+| | direct | 1.816 | **1.443 (−20.5%)** | 1.122 | 0.695 | 1.342 | 0.25 °/s |
+| MH_04 | euroc | 6.942 | **5.444 (−21.6%)** | 4.845 | 0.448 | 6.349 | 0.25 °/s |
+| | accelfirst | 6.942 | **5.401 (−22.2%)** | 4.750 | 0.442 | 6.142 | 0.26 °/s |
+| | direct | 6.942 | **5.517 (−20.5%)** | 4.822 | 0.919 | 6.071 | 1.82 °/s |
+| TUM-VI room1 | euroc | 1.013 | **0.808 (−20.3%)** | 0.744 | 0.839 | 0.755 | 0.81 °/s |
+| | accelfirst | 1.013 | **0.805 (−20.6%)** | 0.743 | 0.846 | 0.756 | 0.82 °/s |
+| | direct | 1.013 | **0.812 (−19.9%)** | 0.759 | 0.875 | 0.795 | 0.84 °/s |
 
-Values are means over the runs in each group, in metres except rotation. **Every group beats the stand-still baseline by 17.5–21.2%.** ATE is the RMSE after SE(3) alignment, the same as `evo_ape -a`. The stand-still baseline is a trajectory that never moves, the honest bar for IMU-only estimation; raw double integration of the same data is 132–1,511 m off. Ground truth is the EuRoC state estimate or the TUM-VI motion capture on every IMU stamp, excluding stamps inside mocap dropouts (TUM-VI has gaps of up to 1 s).
+Values are means over the runs in each group, in metres except rotation. **Every group beats the stand-still baseline by 17.9–22.2%** (all 52 runs; the worst single run is −14.3%). ATE is the RMSE after SE(3) alignment, the same as `evo_ape -a`. The stand-still baseline is a trajectory that never moves, the honest bar for IMU-only estimation; raw double integration of the same data is 132–1,511 m off. Ground truth is the EuRoC state estimate or the TUM-VI motion capture on every IMU stamp, excluding stamps inside mocap dropouts (TUM-VI has gaps of up to 1 s).
 
 **What was fitted where.** The smoother, shrinkage and drag parameters were selected on V1_01 alone and confirmed on V1_02. MH_04 and TUM-VI were brought in as unseen data. They exposed the two bugs described below, whose fixes are general detectors with physically motivated thresholds, not fitted parameters. The one parameter chosen across all four sequences is the blind-segment velocity decay (0.25 s). So MH_04 and TUM-VI are no longer pure holdouts, and the next validation step would be another unseen sequence (for example MH_05 or TUM-VI room2).
 
@@ -148,6 +148,10 @@ Key findings along the way:
 4. **Rotor-drag velocity aiding.** On a multirotor, sideways specific force is rotor drag, which is proportional to body velocity: a drift-free velocity signal from the IMU alone. It's worth 21% of the objective on V1_01. On the handheld TUM-VI the original detector (specific-force direction spread) was fooled: a phone carried roughly level also keeps its specific force near vertical. Drag is now also gated on **rotor vibration** (sample-to-sample accelerometer energy): at least 1.4 m/s² for multirotors in flight, under 0.4 for handheld even at maximum official degradation. The gain (−2.45 s) was fitted on V1_01 ground truth. A larger gain looked better on V1_01 but worse on V1_02, so it was rejected.
 5. **Offline zero-phase smoothing.** Forward and backward leaky integrations are averaged, streamed through a temp file so memory stays O(1). The post-failure tail keeps the forward dead reckoning, since there's nothing after it to smooth with.
 6. **The official degradation favours trusting the IMU more:** no output shrinkage, and faster velocity fusion than my own degradation model suggested.
+7. **Short gaps are interpolated, not dead-reckoned.** Dropped rows (timestamp jumps) and invalid rows inside the data (stuck, NaN, zero) of up to 0.5 s are filled by interpolating between the valid samples on either side, which is possible because the task is offline. Previously every short gap decayed the rotation rate within 0.1 s, so turns during a dropout were lost. Rotation error fell from 0.71 to 0.27 °/s on V1_02 and from 1.80 to 0.82 °/s on TUM-VI, with position unchanged. Longer gaps (the 2 s blackout, the 5 s failure) are still dead-reckoned: bridging them linearly scored worse. The one case that got worse is MH_04 in `direct` mode (1.45 → 1.82 °/s), where the gyro carries accelerometer-level bias and zeroing the rate during gaps happened to help.
+8. **Output gain 1.2.** The leaky integrators attenuate slow motion and SE(3) alignment cannot rescale, so trajectories came out too small: the best post-hoc gain was about 1.1 on the Vicon flights and 1.8–1.9 on MH_04 and TUM-VI. A gain of 1.2 improves the objective on three sequences and costs V1_02 0.5%; translational RPE improves on all four (−3% to −10%). Choosing the gain leave-one-sequence-out improves the held-out sequence in 3 of 4 cases. Larger gains help the big hall more but hurt V1_02, so 1.2 is the conservative choice.
+
+Tried and rejected in this round: gravity-aided attitude for hand-held devices (no gain once gaps were interpolated; worse rotation at higher gains).
 
 ## Verification
 
