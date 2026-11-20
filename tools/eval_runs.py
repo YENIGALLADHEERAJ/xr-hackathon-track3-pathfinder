@@ -19,7 +19,8 @@ sys.path[:0] = [os.path.join(HERE, "..", "src"), HERE]
 import main as M          # noqa: E402
 import evaluate as E      # noqa: E402
 
-PURE = dict(kp=0.0, ki=0.0, tau_ba=1e9, tau_aw=1e9, tau_v=1e9, tau_p=1e9, shrink_gamma=0.0)
+PURE = dict(kp=0.0, ki=0.0, tau_ba=1e9, tau_aw=1e9, tau_v=1e9, tau_p=1e9, shrink_gamma=0.0,
+            drag=0.0, smooth=0.0, out_gain=1.0)   # raw strapdown: no leaks, drag, smoothing
 
 
 def zero(d):
@@ -48,7 +49,7 @@ def main():
         k, v = kv.split("=", 1)
         prm[k] = float(v)
     tmp = tempfile.mkdtemp()
-    hdr = "%-22s %6s %8s %7s %7s %7s %8s %7s" % ("run", "zero", "pure", "ATE", "ckpt", "blind5", "dropout", "rot°/s")
+    hdr = "%-22s %6s %8s %7s %7s %7s %8s %7s" % ("run", "zero", "pure", "ATE", "ckpt", "blind5", "dropout", "rot dps")
     print(hdr)
     rows = []
     for d in sorted(glob.glob(os.path.join(a.runs, "*"))):

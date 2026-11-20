@@ -1103,16 +1103,24 @@ def _smooth(t1_path, tmpdir, out, prm, k_last):
             f3.write(b"".join(buf))
         # C: forward position, average, write poses
         with open(t3_path, "rb") as f3:
+            # Record k of vb.bin holds the backward position at the START of step k,
+            # i.e. at the end of step k-1.  Read one record ahead so the forward
+            # position at the end of step k is averaged with the backward position
+            # at that same instant, and rows before the first step (pf = 0) get the
+            # smoothed start position instead of the origin.
             itb = _read_bwd(f3, V6)
+            nxt = next(itb, None)
             pf = [0.0, 0.0, 0.0]
-            ps = [0.0, 0.0, 0.0]
+            ps = [0.5 * nxt[3], 0.5 * nxt[4], 0.5 * nxt[5]] if nxt else [0.0, 0.0, 0.0]
             ps_fail = [0.0, 0.0, 0.0]
             pos_ref = [0.0, 0.0, 0.0]
             count = 0
             lines = []
             for r in _read_fwd(f1, REC):
                 if r[0] != ROW:
-                    vx, vy, vz, bx, by, bz = next(itb)
+                    vx, vy, vz = nxt[0], nxt[1], nxt[2]
+                    nxt = next(itb, None)
+                    bx, by, bz = (nxt[3], nxt[4], nxt[5]) if nxt else (0.0, 0.0, 0.0)
                     dt = r[4]
                     lp = 1.0 - dt / tps
                     pf = [(pf[0] + vx * dt) * lp, (pf[1] + vy * dt) * lp, (pf[2] + vz * dt) * lp]
