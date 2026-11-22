@@ -11,7 +11,7 @@ team_name.zip
     └── README.md              # method, output contract, budgets
 ```
 
-The repository also contains `tools/` (validation only; numpy), a `Dockerfile`, CI, and `DEMO_SCRIPT.md`.
+The repository also contains `tools/` (validation only; numpy), a `Dockerfile`, CI, and the presentation deck in `docs/`.
 
 ## Run
 
