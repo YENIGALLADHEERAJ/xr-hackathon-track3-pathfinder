@@ -43,9 +43,16 @@ import os
 import struct
 import sys
 import time
+from array import array
 
 # zipfile, decimal, json, platform and tempfile are imported only where they are
 # needed: together with argparse they would add ~3 MB to the heap at start-up.
+
+# --- module-level math aliases (avoid attribute lookup per call) ---
+_sqrt = math.sqrt
+_sin = math.sin
+_cos = math.cos
+_exp = math.exp
 
 # --------------------------------------------------------------------------
 # Tunable parameters. Selected on real EuRoC V1_01 degraded with the organizers'
@@ -159,9 +166,34 @@ def q_from_two_vectors(u, v):
 # Estimator
 # --------------------------------------------------------------------------
 class PathFinder:
+    __slots__ = (
+        "p", "_qw", "_qx", "_qy", "_qz",
+        "pos", "v", "vs", "ws", "bg", "ba", "mw", "g", "t_prev", "dt_nom",
+        "last_raw", "stale", "ref", "dn", "rej",
+        "nw", "na", "na_min", "t_run", "beta",
+        "ew", "ea", "static_t",
+        "_gap_factor", "_spike_k", "_tau_v", "_tau_p", "_tau_vb", "_tau_wb",
+        "_tau_ba", "_tau_aw", "_kp_static", "_kp", "_ki", "_interp_max",
+        "_tau_n", "_tau_c", "_tau_fd", "_tau_spread",
+        "_spread_lo", "_spread_hi", "_vib_lo", "_vib_hi",
+        "_drag_warm", "_drag_gain", "_drag",
+        "_tau_vs", "_tau_ps", "_tau_vbs", "_horizon_s",
+        "_out_gain", "_shrink_gamma", "_gravity", "_g15",
+        "_inv_tau_v", "_inv_tau_p", "_inv_tau_vb", "_inv_tau_wb",
+        "_inv_tau_ba", "_inv_tau_aw", "_inv_tau_n", "_inv_tau_c",
+        "_inv_tau_fd", "_inv_tau_spread",
+        "_inv_tau_vs", "_inv_tau_ps", "_inv_tau_vbs",
+        "tb", "v_hold", "w_hold", "fbar", "eref", "lc", "fd",
+        "spread", "gate", "t_drag", "drag_gate_time",
+        "n_invalid", "n_spikes", "n_gaps", "blind_time",
+        "sink", "last_good", "last_good_ts",
+        "pending", "long_gap", "p_last_raw", "p_stale",
+        "init_static",
+    )
+
     def __init__(self, prm):
         self.p = prm
-        self.q = (1.0, 0.0, 0.0, 0.0)
+        self._qw, self._qx, self._qy, self._qz = 1.0, 0.0, 0.0, 0.0
         self.pos = [0.0, 0.0, 0.0]
         self.v = [0.0, 0.0, 0.0]
         self.vs = [0.0, 0.0, 0.0]          # smoothed velocity (for dead reckoning)
@@ -217,6 +249,21 @@ class PathFinder:
         self._out_gain = p["out_gain"]
         self._shrink_gamma = p["shrink_gamma"]
         self._gravity = 9.81
+        self._g15 = 0.15 * 9.81          # 0.15 * g, precomputed for trust calc
+        # --- precomputed inverse time constants (avoid division per sample) ---
+        self._inv_tau_v = 1.0 / p["tau_v"]
+        self._inv_tau_p = 1.0 / p["tau_p"]
+        self._inv_tau_vb = 1.0 / p["tau_vb"]
+        self._inv_tau_wb = 1.0 / p["tau_wb"]
+        self._inv_tau_ba = 1.0 / p["tau_ba"]
+        self._inv_tau_aw = 1.0 / p["tau_aw"]
+        self._inv_tau_n = 1.0 / p["tau_n"]
+        self._inv_tau_c = 1.0 / p["tau_c"]
+        self._inv_tau_fd = 1.0 / p["tau_fd"]
+        self._inv_tau_spread = 1.0 / p["tau_spread"]
+        self._inv_tau_vs = 1.0 / p["tau_vs"]
+        self._inv_tau_ps = 1.0 / p["tau_ps"]
+        self._inv_tau_vbs = 1.0 / p["tau_vbs"]
 
         # dead-reckoning state
         self.tb = 0.0                      # time spent blind
@@ -274,8 +321,9 @@ class PathFinder:
             self.bg = mw[:]
             self.g = norm
             self.static_t = self.p["static_hold_s"]
-        self.q = q_from_two_vectors((mf[0] / norm, mf[1] / norm, mf[2] / norm),
-                                    (0.0, 0.0, 1.0))
+        q = q_from_two_vectors((mf[0] / norm, mf[1] / norm, mf[2] / norm),
+                                (0.0, 0.0, 1.0))
+        self._qw, self._qx, self._qy, self._qz = q
         self.init_static = static
         # thrust axis starts at the resting specific-force direction; the drag-plane
         # basis uses the IMU axis least aligned with it (fixed for continuity)
@@ -303,11 +351,13 @@ class PathFinder:
         if dt > self._gap_factor * dtn:  # timestamp gap -> dropped frames
             self.n_gaps += 1
             gap = dt - dtn
-            k = min(int(gap / dtn + 0.5), 20000)
+            k = int(gap / dtn + 0.5)
+            if k > 20000:
+                k = 20000
             lg = self.last_good
             if (self._interp_max > 0.0 and m is not None and lg is not None and k > 0
                     and (ts - self.last_good_ts) * 1e-9 <= self._interp_max):
-                mg = m if synthetic else self._gate(m, dtn)
+                mg = m if synthetic else self._gate_inline(m, dtn)
                 if mg is not None:          # fill the gap by interpolating the measurements
                     span = float(ts - self.last_good_ts)
                     sub = gap / k
@@ -332,7 +382,7 @@ class PathFinder:
                     self._blind(sub)
             dt = dtn
         if not synthetic:
-            m = self._gate(m, dt)
+            m = self._gate_inline(m, dt)
         if m is None:
             self.n_invalid += 1
             self._blind(dt)
@@ -341,6 +391,53 @@ class PathFinder:
             self._propagate(dt, m)
             if not synthetic:
                 self.last_good, self.last_good_ts = list(m), ts
+
+    def _gate_inline(self, m, dt):
+        """Inlined spike gate: replaces _gate() call to avoid method overhead."""
+        if m is None:
+            return None
+        if m == self.last_raw:
+            self.stale += 1
+        else:
+            self.stale = 0
+            self.last_raw = m
+        if self.stale >= 3:                 # frozen sensor
+            return None
+        if (m[3] == 0.0 and m[4] == 0.0 and m[5] == 0.0):
+            return None
+        for i in range(3):
+            if abs(m[i]) > GYRO_MAX or abs(m[3 + i]) > ACC_MAX:
+                return None
+        ref = self.ref
+        if ref is None:
+            self.ref = list(m)
+            return m
+        if self.tb > 0.0:                   # after a dropout the old reference is stale
+            self.ref = list(m)
+            self.rej = [0] * 6
+            return m
+        k = self._spike_k
+        a = dt / 0.5
+        if a > 1.0:
+            a = 1.0
+        out = list(m)
+        dn = self.dn
+        rej = self.rej
+        for i in range(6):
+            d = m[i] - ref[i]
+            floor = 0.5 if i < 3 else 3.0
+            # impulsive spike -> hold reference; a persistent level change
+            # (3 consecutive rejections) is real and is accepted
+            if abs(d) > k * dn[i] + floor and rej[i] < 2:
+                out[i] = ref[i]
+                rej[i] += 1
+                self.n_spikes += 1
+            else:
+                if rej[i] == 0:
+                    dn[i] += a * (abs(d) - dn[i])
+                rej[i] = 0
+                ref[i] = m[i]
+        return out
 
     # ---------------- offline gap filling for invalid rows ----------------
     def _prevalid(self, m):
@@ -460,35 +557,47 @@ class PathFinder:
 
     # ---------------- strapdown propagation with corrections ----------------
     def _propagate(self, dt, m):
-        bg, ba, v, pos = self.bg, self.ba, self.v, self.pos
+        # --- hoist all state to locals (avoid self. attribute lookups) ---
+        bg = self.bg; ba = self.ba; v = self.v; pos = self.pos
+        ws = self.ws; vs = self.vs; dn = self.dn; rej = self.rej
+        fbar = self.fbar; lc = self.lc; fd = self.fd; mw = self.mw
+        g = self.g; g15 = self._g15
+        sqrt = _sqrt; sin = _sin; cos = _cos; exp = _exp
+
         wx, wy, wz = m[0] - bg[0], m[1] - bg[1], m[2] - bg[2]
         fx, fy, fz = m[3], m[4], m[5]
-        g = self.g
 
         # --- noise & static detection ---
         a_n = min(1.0, dt / 2.0)
         a_s = min(1.0, dt / 0.2)
-        ref = self.dn
-        self.nw += a_n * ((ref[0] ** 2 + ref[1] ** 2 + ref[2] ** 2) - self.nw)
-        self.na += a_n * ((ref[3] ** 2 + ref[4] ** 2 + ref[5] ** 2) - self.na)
+        self.nw += a_n * ((dn[0] * dn[0] + dn[1] * dn[1] + dn[2] * dn[2]) - self.nw)
+        self.na += a_n * ((dn[3] * dn[3] + dn[4] * dn[4] + dn[5] * dn[5]) - self.na)
         self.t_run += dt
         if self.t_run > 3.0 and self.na < self.na_min:
             self.na_min = self.na
-        fn = math.sqrt(fx * fx + fy * fy + fz * fz)
+        fn = sqrt(fx * fx + fy * fy + fz * fz)
         self.ew += a_s * ((wx * wx + wy * wy + wz * wz) - self.ew)
-        self.ea += a_s * ((fn - g) ** 2 - self.ea)
-        still = (self.ew < 4.0 * self.nw + 0.02 ** 2 and
-                 self.ea < 1.5 * self.na + 0.15 ** 2)
+        self.ea += a_s * ((fn - g) * (fn - g) - self.ea)
+        still = (self.ew < 4.0 * self.nw + 0.0004 and
+                 self.ea < 1.5 * self.na + 0.0225)
         self.static_t = self.static_t + dt if still else 0.0
-        static = self.static_t >= 1e9  # static_hold_s cached as 1e9 by default
+        static = self.static_t >= 1e9
 
         # --- attitude: gravity-aided complementary filter ---
-        R = q_to_rot(self.q)
-        vx, vy, vz = R[2][0], R[2][1], R[2][2]           # estimated "up" in body
+        # Inline q_to_rot(self.q): compute rotation matrix directly (no tuple overhead)
+        qw, qx, qy, qz = self._qw, self._qx, self._qy, self._qz
+        xx, yy, zz = qx * qx, qy * qy, qz * qz
+        xy, xz, yz = qx * qy, qx * qz, qy * qz
+        wxq, wyq, wzq = qw * qx, qw * qy, qw * qz
+        r20 = 2.0 * (xz - wyq)
+        r21 = 2.0 * (yz + wxq)
+        r22 = 1.0 - 2.0 * (xx + yy)
+        vx, vy, vz = r20, r21, r22           # estimated "up" in body
+
         if fn > 1e-6:
             ux, uy, uz = fx / fn, fy / fn, fz / fn
-            r = (fn - g) / (0.15 * g)
-            trust = math.exp(-r * r)
+            r = (fn - g) / g15
+            trust = exp(-r * r)
             ex = uy * vz - uz * vy
             ey = uz * vx - ux * vz
             ez = ux * vy - uy * vx
@@ -500,90 +609,129 @@ class PathFinder:
             bg[0] -= ki * ex
             bg[1] -= ki * ey
             bg[2] -= ki * ez
+
         if static:                                       # gyro bias at rest
             b = min(1.0, dt / 1.0)
             bg[0] += b * (m[0] - bg[0])
             bg[1] += b * (m[1] - bg[1])
             bg[2] += b * (m[2] - bg[2])
-        self.q = q_integrate(self.q, wx, wy, wz, dt)
-        b = min(1.0, dt / 0.1)
-        ws = self.ws
+
+        # --- inline q_integrate(self.q, wx, wy, wz, dt) ---
+        ang = sqrt(wx * wx + wy * wy + wz * wz) * dt
+        if ang >= 1e-12:
+            h = 0.5 * ang
+            s = sin(h) / (ang / dt)
+            c = cos(h)
+            sx, sy, sz = wx * s, wy * s, wz * s
+            # q_mul(q, (c, sx, sy, sz)) then q_norm
+            nw = qw * c - qx * sx - qy * sy - qz * sz
+            nx = qw * sx + qx * c + qy * sz - qz * sy
+            ny = qw * sy - qx * sz + qy * c + qz * sx
+            nz = qw * sz + qx * sy - qy * sx + qz * c
+            qnorm = sqrt(nw * nw + nx * nx + ny * ny + nz * nz)
+            qw, qx, qy, qz = nw / qnorm, nx / qnorm, ny / qnorm, nz / qnorm
+            self._qw, self._qx, self._qy, self._qz = qw, qx, qy, qz
+
+        # --- smoothed angular rate ---
+        b = dt / 0.1
+        if b > 1.0:
+            b = 1.0
         ws[0] += b * (wx - ws[0])
         ws[1] += b * (wy - ws[1])
         ws[2] += b * (wz - ws[2])
 
         # --- accelerometer bias / mean tracking (body frame) ---
-        R = q_to_rot(self.q)
-        vx, vy, vz = R[2][0], R[2][1], R[2][2]
+        # Recompute full rotation matrix from updated quaternion
+        xx, yy, zz = qx * qx, qy * qy, qz * qz
+        xy, xz, yz = qx * qy, qx * qz, qy * qz
+        wxq, wyq, wzq = qw * qx, qw * qy, qw * qz
+        r00 = 1.0 - 2.0 * (yy + zz)
+        r01 = 2.0 * (xy - wzq)
+        r02 = 2.0 * (xz + wyq)
+        r10 = 2.0 * (xy + wzq)
+        r11 = 1.0 - 2.0 * (xx + zz)
+        r12 = 2.0 * (yz - wxq)
+        r20 = 2.0 * (xz - wyq)
+        r21 = 2.0 * (yz + wxq)
+        r22 = 1.0 - 2.0 * (xx + yy)
+        vx, vy, vz = r20, r21, r22
+
         tba = 0.5 if static else self._tau_ba
         b = min(1.0, dt / tba)
         ba[0] += b * (fx - g * vx - ba[0])
         ba[1] += b * (fy - g * vy - ba[1])
         ba[2] += b * (fz - g * vz - ba[2])
         bx, by, bz = fx - ba[0], fy - ba[1], fz - ba[2]
-        ax = R[0][0] * bx + R[0][1] * by + R[0][2] * bz
-        ay = R[1][0] * bx + R[1][1] * by + R[1][2] * bz
-        az = R[2][0] * bx + R[2][1] * by + R[2][2] * bz - g
-        mw = self.mw
-        b = min(1.0, dt / self._tau_aw)
-        mw[0] += b * (ax - mw[0])
-        mw[1] += b * (ay - mw[1])
-        mw[2] += b * (az - mw[2])
-        ax -= mw[0]
-        ay -= mw[1]
-        az -= mw[2]
+        ax = r00 * bx + r01 * by + r02 * bz
+        ay = r10 * bx + r11 * by + r12 * bz
+        az = r20 * bx + r21 * by + r22 * bz - g
+
+        mw0, mw1, mw2 = mw
+        b = dt * self._inv_tau_aw
+        if b > 1.0:
+            b = 1.0
+        mw0 += b * (ax - mw0)
+        mw1 += b * (ay - mw1)
+        mw2 += b * (az - mw2)
+        mw[0], mw[1], mw[2] = mw0, mw1, mw2
+        ax -= mw0
+        ay -= mw1
+        az -= mw2
 
         # --- rotor-drag velocity aiding ---
-        # On a multirotor, thrust acts along a body-fixed axis, so the accelerometer's
-        # component perpendicular to it is rotor drag ~ -k * (body velocity): a
-        # drift-free velocity measurement from the IMU alone.  The gain is a vehicle
-        # constant (fitted once on EuRoC V1_01 ground truth, validated on the held-out
-        # V1_02).  A multirotor detector gates it: on a multirotor the specific force
-        # stays within a few degrees of the thrust axis, while handheld motion swings
-        # it by tens of degrees, which shuts the gate and leaves the filter unchanged.
         drag_on = False
         vtx = vty = vtz = 0.0
         if self._drag > 0.0 and not static:
-            fb = self.fbar
-            b = min(1.0, dt / self._tau_n)
-            fb[0] += b * (fx - fb[0])
-            fb[1] += b * (fy - fb[1])
-            fb[2] += b * (fz - fb[2])
-            nn = math.sqrt(fb[0] * fb[0] + fb[1] * fb[1] + fb[2] * fb[2])
+            fb0, fb1, fb2 = fbar
+            b = dt * self._inv_tau_n
+            if b > 1.0:
+                b = 1.0
+            fb0 += b * (fx - fb0)
+            fb1 += b * (fy - fb1)
+            fb2 += b * (fz - fb2)
+            fbar[0], fbar[1], fbar[2] = fb0, fb1, fb2
+            nn = sqrt(fb0 * fb0 + fb1 * fb1 + fb2 * fb2)
             if nn > 1e-6 and fn > 1e-6:
-                nx, ny, nz = fb[0] / nn, fb[1] / nn, fb[2] / nn
-                # multirotor detector: mean squared angle between f and thrust axis
+                nx, ny, nz = fb0 / nn, fb1 / nn, fb2 / nn
                 cs = (fx * nx + fy * ny + fz * nz) / fn
-                b = min(1.0, dt / self._tau_spread)
+                b = dt * self._inv_tau_spread
+                if b > 1.0:
+                    b = 1.0
                 self.spread += b * (2.0 * (1.0 - cs) - self.spread)
                 e = self.eref
-                ex_, ey_, ez_ = (1.0 if e == 0 else 0.0), (1.0 if e == 1 else 0.0), (1.0 if e == 2 else 0.0)
+                ex_ = 1.0 if e == 0 else 0.0
+                ey_ = 1.0 if e == 1 else 0.0
+                ez_ = 1.0 if e == 2 else 0.0
                 c1x = ny * ez_ - nz * ey_
                 c1y = nz * ex_ - nx * ez_
                 c1z = nx * ey_ - ny * ex_
-                cn = math.sqrt(c1x * c1x + c1y * c1y + c1z * c1z)
+                cn = sqrt(c1x * c1x + c1y * c1y + c1z * c1z)
                 c1x, c1y, c1z = c1x / cn, c1y / cn, c1z / cn
                 c2x = ny * c1z - nz * c1y
                 c2y = nz * c1x - nx * c1z
                 c2z = nx * c1y - ny * c1x
                 l1 = fx * c1x + fy * c1y + fz * c1z
                 l2 = fx * c2x + fy * c2y + fz * c2z
-                lc, fd = self.lc, self.fd
-                b = min(1.0, dt / self._tau_c)
-                lc[0] += b * (l1 - lc[0])
-                lc[1] += b * (l2 - lc[1])
-                b = min(1.0, dt / self._tau_fd)
-                fd[0] += b * ((l1 - lc[0]) - fd[0])
-                fd[1] += b * ((l2 - lc[1]) - fd[1])
+                lc0, lc1 = lc
+                fd0, fd1 = fd
+                b = dt * self._inv_tau_c
+                if b > 1.0:
+                    b = 1.0
+                lc0 += b * (l1 - lc0)
+                lc1 += b * (l2 - lc1)
+                lc[0], lc[1] = lc0, lc1
+                b = dt * self._inv_tau_fd
+                if b > 1.0:
+                    b = 1.0
+                fd0 += b * ((l1 - lc0) - fd0)
+                fd1 += b * ((l2 - lc1) - fd1)
+                fd[0], fd[1] = fd0, fd1
                 self.t_drag += dt
-                ang = math.sqrt(self.spread) if self.spread > 0.0 else 0.0   # rms angle [rad]
+                ang = sqrt(self.spread) if self.spread > 0.0 else 0.0
                 lo, hi = self._spread_lo, self._spread_hi
                 gk = (hi - ang) / (hi - lo)
                 gate = 0.0 if gk < 0.0 else (1.0 if gk > 1.0 else gk)
-                # rotor vibration: multirotor IMUs show >= 1.4 m/s^2 of sample-to-sample
-                # accelerometer energy in flight, handheld devices < 0.4 even under the
-                # official degradation; without vibration the drag model does not apply
-                vib = math.sqrt(self.na) if self.na > 0.0 else 0.0
+                vib = sqrt(self.na) if self.na > 0.0 else 0.0
                 gv = (vib - self._vib_lo) / (self._vib_hi - self._vib_lo)
                 gate *= 0.0 if gv < 0.0 else (1.0 if gv > 1.0 else gv)
                 if self.t_drag < self._drag_warm:
@@ -591,14 +739,14 @@ class PathFinder:
                 self.gate = gate
                 if gate > 0.0:
                     kg = gate * self._drag_gain
-                    s1 = kg * fd[0]
-                    s2 = kg * fd[1]
+                    s1 = kg * fd0
+                    s2 = kg * fd1
                     tbx = s1 * c1x + s2 * c2x
                     tby = s1 * c1y + s2 * c2y
                     tbz = s1 * c1z + s2 * c2z
-                    vtx = R[0][0] * tbx + R[0][1] * tby + R[0][2] * tbz
-                    vty = R[1][0] * tbx + R[1][1] * tby + R[1][2] * tbz
-                    vtz = R[2][0] * tbx + R[2][1] * tby + R[2][2] * tbz
+                    vtx = r00 * tbx + r01 * tby + r02 * tbz
+                    vty = r10 * tbx + r11 * tby + r12 * tbz
+                    vtz = r20 * tbx + r21 * tby + r22 * tbz
                     drag_on = True
                     self.drag_gate_time += dt * gate
 
@@ -608,28 +756,29 @@ class PathFinder:
         # --- translation ---
         ox, oy, oz = v
         if static:
-            dec = math.exp(-dt / 0.05)
-            v[0] *= dec
-            v[1] *= dec
-            v[2] *= dec
-        elif drag_on:                       # leak toward the drag-measured velocity
-            dec = 1.0 - dt / self._tau_v
-            kv = dt / self._tau_v
+            dec = exp(-dt / 0.05)
+            v[0] = v[0] * dec
+            v[1] = v[1] * dec
+            v[2] = v[2] * dec
+        elif drag_on:
+            dec = 1.0 - dt * self._inv_tau_v
+            kv = dt * self._inv_tau_v
             v[0] = (v[0] + ax * dt) * dec + vtx * kv
             v[1] = (v[1] + ay * dt) * dec + vty * kv
             v[2] = (v[2] + az * dt) * dec + vtz * kv
         else:
-            dec = 1.0 - dt / self._tau_v
+            dec = 1.0 - dt * self._inv_tau_v
             v[0] = (v[0] + ax * dt) * dec
             v[1] = (v[1] + ay * dt) * dec
             v[2] = (v[2] + az * dt) * dec
-        lp = 1.0 - dt / self._tau_p
+        lp = 1.0 - dt * self._inv_tau_p
         h = 0.5 * dt
         pos[0] = (pos[0] + h * (ox + v[0])) * lp
         pos[1] = (pos[1] + h * (oy + v[1])) * lp
         pos[2] = (pos[2] + h * (oz + v[2])) * lp
-        b = min(1.0, dt / 0.2)
-        vs = self.vs
+        b = dt / 0.2
+        if b > 1.0:
+            b = 1.0
         vs[0] += b * (v[0] - vs[0])
         vs[1] += b * (v[1] - vs[1])
         vs[2] += b * (v[2] - vs[2])
@@ -643,10 +792,25 @@ class PathFinder:
             self.w_hold = self.ws[:]
         self.tb += dt
         self.blind_time += dt
-        dw = math.exp(-self.tb / self._tau_wb)
+        dw = exp(-self.tb * self._inv_tau_wb)
         wh = self.w_hold
-        self.q = q_integrate(self.q, wh[0] * dw, wh[1] * dw, wh[2] * dw, dt)
-        dv = math.exp(-self.tb / self._tau_vb)
+        # --- inline q_integrate(self.q, wh[0]*dw, wh[1]*dw, wh[2]*dw, dt) ---
+        qw, qx, qy, qz = self._qw, self._qx, self._qy, self._qz
+        wx, wy, wz = wh[0] * dw, wh[1] * dw, wh[2] * dw
+        ang = sqrt(wx * wx + wy * wy + wz * wz) * dt
+        if ang >= 1e-12:
+            h = 0.5 * ang
+            s = sin(h) / (ang / dt)
+            c = cos(h)
+            sx, sy, sz = wx * s, wy * s, wz * s
+            nw = qw * c - qx * sx - qy * sy - qz * sz
+            nx = qw * sx + qx * c + qy * sz - qz * sy
+            ny = qw * sy - qx * sz + qy * c + qz * sx
+            nz = qw * sz + qx * sy - qy * sx + qz * c
+            qnorm = sqrt(nw * nw + nx * nx + ny * ny + nz * nz)
+            qw, qx, qy, qz = nw / qnorm, nx / qnorm, ny / qnorm, nz / qnorm
+            self._qw, self._qx, self._qy, self._qz = qw, qx, qy, qz
+        dv = exp(-self.tb * self._inv_tau_vb)
         v, pos, vh = self.v, self.pos, self.v_hold
         for i in range(3):
             nv = vh[i] * dv
@@ -654,14 +818,17 @@ class PathFinder:
             v[i] = nv
 
     def pose(self):
-        w, x, y, z = self.q
+        w, x, y, z = self._qw, self._qx, self._qy, self._qz
         if w < 0.0:
             w, x, y, z = -w, -x, -y, -z
         # noise-adaptive shrinkage: as the measured accelerometer noise rises
         # above the best level seen, trust the integrated position less
         gam = self._shrink_gamma
         if gam > 0.0 and self.na > 0.0 and self.na_min < 1e8:
-            b = min(1.0, (self.na_min / self.na) ** (0.5 * gam))
+            ratio = self.na_min / self.na
+            b = ratio ** (0.5 * gam)
+            if b > 1.0:
+                b = 1.0
             self.beta += 0.01 * (b - self.beta)
         pos = self.pos
         bt = self.beta * self._out_gain
