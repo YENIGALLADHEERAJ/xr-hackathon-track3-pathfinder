@@ -13,18 +13,6 @@ team_name.zip
 
 The repository also contains `tools/` (validation only; numpy), a `Dockerfile`, CI, `DEMO_SCRIPT.md`, and `docs/`.
 
-## Performance vs Track 3 Budget & Competition
-
-| Metric | Our Result | Track 3 Limit | Ghost-Track (competitor) | Winner |
-|--------|-----------|---------------|--------------------------|--------|
-| **Peak heap RAM** | **0.44–0.51 MB** | ≤ 8 MB | 0.84–1.12 MB | 🟢 **Us** (2× better) |
-| **Compute / IMU-second** | **~1.2–1.5 ms** | ≤ 20 ms | 1.5–1.6 ms | 🟢 **Us** (target beat) |
-| **Total runtime (83.5 s)** | **~0.13–0.23 s** | < 1.5 s | ~0.28 s | 🟢 **Us** (~2× faster) |
-| **ATE vs never-moving** | **17–22% better** (52 runs) | — | ~7% better (8 runs) | 🟢 **Us** (2–3× margin) |
-| **Threads** | 1 | 1 | 1 | Tie |
-
-**Key advantage:** We use less than half the memory budget and achieve 2–3× larger accuracy improvement over the never-moving baseline than the leading competitor.
-
 ## Run
 
 ```bash
@@ -81,7 +69,7 @@ It runs `main.py`, verifies the output against the input (one pose per IMU row, 
 | Estimate from the IMU file only | No other input is read |
 | Offline; future samples may be used | Two-pass zero-phase smoother |
 | ≤ 8 MB peak RAM, **measured at heap level** | **0.44–0.51 MB** heap peak while estimating (tracemalloc), constant in sequence length. |
-| ≤ 20 ms compute per 1 s of IMU, one thread | **~1.2–1.5 ms** per IMU-second, single thread (optimized: `__slots__`, separate quaternion floats, inlined `q_to_rot`/`q_integrate`/`_gate`, module-level math aliases, precomputed inverse time constants, inline `min()`) |
+| ≤ 20 ms compute per 1 s of IMU, one thread | **~1.2–1.5 ms** per IMU-second, single thread |
 | SE(3)-aligned ATE and RPE (evo) | Output frame: z-up, gravity aligned, starting at the origin |
 
 ## Rotor-Drag Velocity Model (reported in `metadata.json`)

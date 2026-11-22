@@ -8,17 +8,16 @@ Standalone Python 3.8+ standard library only — no `pip install`, no numpy, sin
 python main.py evaluation_dataset.zip -o estimated_trajectory.txt --metadata metadata.json
 ```
 
-## Performance vs Track 3 Budget & Competition
+## Budgets
 
-| Metric | Our Result | Track 3 Limit | Ghost-Track (competitor) | Winner |
-|--------|-----------|---------------|--------------------------|--------|
-| **Peak heap RAM** | **0.44–0.51 MB** | ≤ 8 MB | 0.84–1.12 MB | 🟢 **Us** (2× better) |
-| **Compute / IMU-second** | **~1.2–1.5 ms** | ≤ 20 ms | 1.5–1.6 ms | 🟢 **Us** (target beat) |
-| **Total runtime (83.5 s)** | **~0.13–0.23 s** | < 1.5 s | ~0.28 s | 🟢 **Us** (~2× faster) |
-| **ATE vs never-moving** | **17–22% better** (52 runs) | — | ~7% better (8 runs) | 🟢 **Us** (2–3× margin) |
-| **Threads** | 1 | 1 | 1 | Tie |
+| Budget | Limit | Measured |
+|--------|-------|----------|
+| Peak RAM (heap: data structures, buffers, estimation) | ≤ 8 MB | **0.44–0.51 MB**, constant in sequence length (streaming; I/O in 256–512-record batches). Python compiling the script itself transiently needs ~4.6 MB more, before estimation starts. |
+| Compute per 1 s of IMU | ≤ 20 ms | **~1.2–1.5 ms** (aggressive optimization: `__slots__`, separate quaternion float attributes, inlined `q_to_rot`/`q_integrate`/`_gate`, module-level math aliases, precomputed inverse time constants, inline `min()`) |
+| Total runtime (83.5 s V1_02 sequence) | < 1.5 s | **~0.13–0.23 s** |
+| Threads | 1 | 1 |
 
-**Key advantage:** We use less than half the memory budget and achieve 2–3× larger accuracy improvement over the never-moving baseline than the leading competitor.
+Measured on Windows 11 with Python 3.11 on real EuRoC flights degraded with `degrade_imu.py`, two-pass smoother on (default). Track 3 FAQ measures the 8 MB at heap level, not process RSS.
 
 ## Run
 
@@ -58,7 +57,7 @@ Unknown flags are ignored with a warning; missing output folders are created; an
 
 | Property | Detection |
 |----------|-----------|
-| Column order | Accelerometer triplet = median norm ~1 g. EuRoC is gyro-first; `degrade_imu.py` documents accel-first. Header cross-checked, not blindly trusted. |
+| Column order | The accelerometer triplet = median norm ~1 g. EuRoC is gyro-first; `degrade_imu.py` documents accel-first. Header cross-checked, not blindly trusted. |
 | Timestamp unit | s / ms / µs / ns from median spacing (same thresholds as `degrade_imu.py`), exact ns conversion |
 | Accelerometer unit | Median norm 0.5–2 ⇒ g, converted to m/s² |
 | Gyro unit | `deg` in gyro header names, or `--gyro-deg` |
@@ -109,17 +108,6 @@ The design is a streaming complementary filter with O(1) memory per row:
 }
 ```
 
-## Budgets
-
-Measured on Windows 11 with Python 3.11 on real EuRoC flights degraded with `degrade_imu.py`, two-pass smoother on (default). Track 3 FAQ measures 8 MB at heap level, not process RSS.
-
-| Budget | Limit | Measured |
-|--------|-------|----------|
-| Peak RAM (heap: data structures, buffers, estimation) | ≤ 8 MB | **0.44–0.51 MB**, constant in sequence length (streaming; I/O in 256–512-record batches). Python compiling the script itself transiently needs ~4.6 MB more, before estimation starts. |
-| Compute per 1 s of IMU | ≤ 20 ms | **~1.2–1.5 ms** (aggressive optimization: `__slots__`, separate quaternion float attributes, inlined `q_to_rot`/`q_integrate`/`_gate`, module-level math aliases, precomputed inverse time constants, inline `min()` — targets beating Ghost-Track's 1.5 ms) |
-| Total runtime (83.5 s V1_02 sequence) | < 1.5 s | **~0.13–0.23 s** |
-| Threads | 1 | 1 |
-
 ## Validation
 
 **35 contract tests** cover: one pose per row, no appended poses, all-zero/NaN blind rows, accel-first/headerless input, s/ms timestamps, accel in g, duplicated/stuck/garbage rows, dropouts, zip (incl. Windows paths), CRLF, UTF-8 BOM, every call form, smoother-failure fallback:
@@ -167,7 +155,7 @@ CollegeName_TeamName.zip
 | Timestamps ns → s | Exact integer arithmetic, 9 decimals |
 | Dropouts are missing rows | Timestamp gaps bridged by dead reckoning; every remaining row gets a pose |
 | Estimate from IMU file only | No other input read |
-| Offline; future samples may be used | Two-pass zero-phase smoother |
+| Offline; future samples allowed | Two-pass zero-phase smoother |
 | ≤ 8 MB peak RAM (heap level) | 0.44–0.51 MB heap peak |
 | ≤ 20 ms compute per 1 s IMU, one thread | ~1.2–1.5 ms per IMU-second, single thread |
 | SE(3)-aligned ATE/RPE output | z-up, gravity-aligned, origin = start |
