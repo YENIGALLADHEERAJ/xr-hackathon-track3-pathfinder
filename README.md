@@ -34,15 +34,35 @@ The evaluation harness's exact command isn't published, so every plausible call 
 
 Unknown flags are ignored with a warning, a missing output folder is created, and an output path that is a folder gets `estimated_trajectory.txt` inside it. If the offline smoother ever fails, the script falls back to its causal single pass, so a complete trajectory is always written.
 
-Docker:
+### Docker
+
+Build the image from the repository root (it contains only Python 3.11 and `src/main.py`):
 
 ```bash
 docker build -t pathfinder .
 ```
 
+Put `evaluation_dataset.zip` in a folder named `data`, then run from the folder that contains `data`. The folder is mounted at `/data`, which is the container's working directory, so file names are relative to it. The trajectory and metadata are written back into `data`.
+
+Linux / macOS / WSL:
+
 ```bash
-docker run --rm -v "$PWD/data:/data" pathfinder /data/evaluation_dataset.zip -o /data/estimated_trajectory.txt --metadata /data/metadata.json
+docker run --rm -v "$PWD/data:/data" pathfinder evaluation_dataset.zip -o estimated_trajectory.txt --metadata metadata.json
 ```
+
+Windows Command Prompt:
+
+```bat
+docker run --rm -v "%cd%\data:/data" pathfinder evaluation_dataset.zip -o estimated_trajectory.txt --metadata metadata.json
+```
+
+Windows PowerShell:
+
+```powershell
+docker run --rm -v "${PWD}\data:/data" pathfinder evaluation_dataset.zip -o estimated_trajectory.txt --metadata metadata.json
+```
+
+All call forms in the table above work inside the container. With no arguments it finds `imu0/data.csv` under the mounted folder and writes `estimated_trajectory.txt` beside it. `docker run --rm pathfinder --help` lists the options. On Linux the output files are owned by root; add `--user "$(id -u):$(id -g)"` to keep them yours.
 
 **Building the submission bundle** in one step, once the evaluation dataset is released:
 
